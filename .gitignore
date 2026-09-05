@@ -1,0 +1,7 @@
+out/
+dist/
+native/
+*.class
+*.jar
+.idea/
+.vscode/
