@@ -105,6 +105,14 @@ the standard test positions (search "chessprogramming.org Perft Results" for
 the full list) before trusting the search results — it's the fastest way to
 catch a move generation bug.
 
+The static-exchange tests cover winning and losing captures, pins, king
+recaptures, en passant, and promotion:
+
+```bash
+javac --release 8 -cp out -d out test/engine/StaticExchangeTest.java
+java -cp out engine.StaticExchangeTest
+```
+
 ## Setting it up in SCID vs PC
 
 **If the engine "crashes" or does nothing the moment SCID tries to run it,
@@ -182,9 +190,10 @@ UCI loop — but plenty is left on the table on purpose:
   `Bitboards.bishopAttacks(sq, occupancy)`) is already shaped so you can swap
   the implementation without touching any caller.
 - **Search** has null-move pruning, a simple form of PVS with late-move
-  reductions, killer moves, history heuristic, and 25-centipawn aspiration
-  windows, but no futility/razoring pruning or static exchange evaluation (SEE) for
-  capture ordering (currently just MVV-LVA), and no true multi-PV. The `pv`
+  reductions, killer moves, history heuristic, 25-centipawn aspiration windows,
+  and SEE/delta pruning for quiescence captures. Regular capture ordering still
+  uses MVV-LVA; futility/razoring pruning and true multi-PV are not implemented.
+  The `pv`
   reported in `info` lines is reconstructed by walking the transposition
   table after each iteration rather than stored in a dedicated PV table —
   simple and correct, but a real PV table would be more robust.

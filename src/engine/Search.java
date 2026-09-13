@@ -12,7 +12,7 @@ import static engine.Evaluator.*;
  *   - MVV-LVA capture ordering, killer moves, history heuristic
  *   - null-move pruning
  *   - a simple form of PVS (principal variation search) with late move reductions
- *   - quiescence search at leaf nodes to avoid the horizon effect
+ *   - quiescence search with SEE and delta pruning at leaf nodes
  *
  * This is intentionally a "solid but simple" search. Natural next steps to
  * strengthen it: aspiration windows, better LMR conditions, futility/razoring
@@ -26,6 +26,7 @@ public class Search {
     private final TranspositionTable tt;
     private final int[][] killerMoves = new int[MAX_PLY][2];
     private final int[][] historyTable = new int[64][64];
+    private final int[][] seeGains = new int[MAX_PLY][32];
     private long[] keyStack;
     private int historyBase;
 
@@ -338,8 +339,27 @@ public class Search {
             }
             int move = moves.get(i);
 
+            // A capture that cannot lift alpha need not be searched unless it gives check.
+            // Promotions, en passant, and king captures have tactical edge cases, so keep them.
+            boolean prune = false;
+            if (!Move.isPromotion(move) && !Move.isEnPassant(move)
+                    && board.pieceTypeAt(Move.from(move)) != KING
+                    && Math.abs(alpha) < MATE_SCORE - MAX_PLY) {
+                int victim = board.pieceTypeAt(Move.to(move));
+                prune = standPat + PIECE_VALUE[victim] + 200 < alpha;
+                // A cheaper attacker cannot lose material on this square: the
+                // opponent can take at most that attacker before we may stop.
+                if (!prune && PIECE_VALUE[board.pieceTypeAt(Move.from(move))] > PIECE_VALUE[victim]) {
+                    prune = StaticExchange.evaluate(board, move, seeGains[searchPly]) < 0;
+                }
+            }
+
             board.makeMove(move);
             if (board.isInCheck(us)) {
+                board.unmakeMove();
+                continue;
+            }
+            if (prune && !board.isInCheck(board.sideToMove)) {
                 board.unmakeMove();
                 continue;
             }
