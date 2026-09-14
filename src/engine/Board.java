@@ -1,6 +1,6 @@
 package engine;
 
-import java.util.ArrayDeque;
+import java.util.Arrays;
 
 import static engine.Piece.*;
 import static engine.Bitboards.*;
@@ -20,20 +20,30 @@ public class Board {
     public int fullmoveNumber;
     public long zobristKey;
 
-    public int[] mailbox = new int[64]; // encoded as color*6+type, or -1 if empty
+    public byte[] mailbox = new byte[64]; // encoded as color*6+type, or -1 if empty
 
     private static final int EMPTY = -1;
 
-    private static class Undo {
-        int move;
-        int capturedPieceCode; // -1 if none
-        int castlingRights;
-        int epSquare;
-        int halfmoveClock;
-        long zobristKey;
-    }
+    // Each undo takes two longs instead of an allocated object and deque node.
+    // State bits: move 0..15, captured piece + 1 at 16..19, castling rights
+    // 20..23, ep square + 1 at 24..30, signed halfmove clock at 31..62.
+    private long[] historyState = new long[64];
+    private long[] historyKeys = new long[64];
+    private int historySize;
 
-    private final ArrayDeque<Undo> history = new ArrayDeque<>();
+    private void pushHistory(int move, int capturedPieceCode, int oldCastling,
+                             int oldEp, int oldHalfmove, long oldKey) {
+        if (historySize == historyState.length) {
+            historyState = Arrays.copyOf(historyState, historySize * 2);
+            historyKeys = Arrays.copyOf(historyKeys, historySize * 2);
+        }
+        historyState[historySize] = ((long) move & 0xffffL)
+                | ((long) (capturedPieceCode + 1) & 15L) << 16
+                | ((long) oldCastling & 15L) << 20
+                | ((long) (oldEp + 1) & 127L) << 24
+                | ((long) oldHalfmove & 0xffffffffL) << 31;
+        historyKeys[historySize++] = oldKey;
+    }
 
     public Board() {
         setStartPosition();
@@ -48,7 +58,7 @@ public class Board {
             for (int t = 0; t < 6; t++)
                 pieceBB[c][t] = 0L;
         for (int i = 0; i < 64; i++) mailbox[i] = EMPTY;
-        history.clear();
+        historySize = 0;
 
         String[] parts = fen.trim().split("\\s+");
         String boardPart = parts[0];
@@ -65,7 +75,7 @@ public class Board {
                 int type = typeFromChar(Character.toLowerCase(ch));
                 int sq = rank * 8 + file;
                 pieceBB[color][type] |= 1L << sq;
-                mailbox[sq] = color * 6 + type;
+                mailbox[sq] = (byte) (color * 6 + type);
                 file++;
             }
         }
@@ -212,7 +222,7 @@ public class Board {
         pieceBB[color][type] |= 1L << sq;
         occupancy[color] |= 1L << sq;
         allOccupancy |= 1L << sq;
-        mailbox[sq] = color * 6 + type;
+        mailbox[sq] = (byte) (color * 6 + type);
         zobristKey ^= Zobrist.PIECE_KEY[color][type][sq];
     }
 
@@ -222,13 +232,10 @@ public class Board {
     }
 
     public void makeMove(int move) {
-        Undo u = new Undo();
-        u.move = move;
-        u.castlingRights = castlingRights;
-        u.epSquare = epSquare;
-        u.halfmoveClock = halfmoveClock;
-        u.zobristKey = zobristKey;
-        u.capturedPieceCode = EMPTY;
+        int oldCastling = castlingRights;
+        int oldHalfmove = halfmoveClock;
+        long oldKey = zobristKey;
+        int capturedPieceCode = EMPTY;
 
         int from = Move.from(move);
         int to = Move.to(move);
@@ -244,7 +251,7 @@ public class Board {
 
         if (flag == Move.EP_CAPTURE) {
             int capSq = to + (us == WHITE ? -8 : 8);
-            u.capturedPieceCode = them * 6 + PAWN;
+            capturedPieceCode = them * 6 + PAWN;
             removePiece(them, PAWN, capSq);
             movePieceQuiet(us, PAWN, from, to);
         } else if (flag == Move.KING_CASTLE) {
@@ -259,7 +266,7 @@ public class Board {
             boolean isCapture = Move.isCapture(move);
             if (isCapture) {
                 int capturedType = pieceTypeAt(to);
-                u.capturedPieceCode = them * 6 + capturedType;
+                capturedPieceCode = them * 6 + capturedType;
                 removePiece(them, capturedType, to);
             }
             removePiece(us, movingType, from);
@@ -303,7 +310,7 @@ public class Board {
         if (us == BLACK) fullmoveNumber++;
 
         sideToMove = them;
-        history.push(u);
+        pushHistory(move, capturedPieceCode, oldCastling, oldEp, oldHalfmove, oldKey);
     }
 
     private int clearCastlingRightsForSquare(int rights, int sq) {
@@ -315,8 +322,9 @@ public class Board {
     }
 
     public void unmakeMove() {
-        Undo u = history.pop();
-        int move = u.move;
+        long state = historyState[--historySize];
+        int move = (int) state & 0xffff;
+        int capturedPieceCode = ((int) (state >>> 16) & 15) - 1;
         int from = Move.from(move);
         int to = Move.to(move);
         int flag = Move.flag(move);
@@ -343,17 +351,17 @@ public class Board {
             removePieceNoHash(us, placedType, to);
             int originalType = Move.isPromotion(move) ? PAWN : placedType;
             placePieceNoHash(us, originalType, from);
-            if (u.capturedPieceCode != EMPTY) {
-                int capColor = u.capturedPieceCode / 6;
-                int capType = u.capturedPieceCode % 6;
+            if (capturedPieceCode != EMPTY) {
+                int capColor = capturedPieceCode / 6;
+                int capType = capturedPieceCode % 6;
                 placePieceNoHash(capColor, capType, to);
             }
         }
 
-        castlingRights = u.castlingRights;
-        epSquare = u.epSquare;
-        halfmoveClock = u.halfmoveClock;
-        zobristKey = u.zobristKey;
+        castlingRights = (int) (state >>> 20) & 15;
+        epSquare = ((int) (state >>> 24) & 127) - 1;
+        halfmoveClock = (int) (state >>> 31);
+        zobristKey = historyKeys[historySize];
         if (us == BLACK) fullmoveNumber--;
     }
 
@@ -369,7 +377,7 @@ public class Board {
         pieceBB[color][type] |= 1L << sq;
         occupancy[color] |= 1L << sq;
         allOccupancy |= 1L << sq;
-        mailbox[sq] = color * 6 + type;
+        mailbox[sq] = (byte) (color * 6 + type);
     }
 
     private void movePieceQuietNoHash(int color, int type, int from, int to) {
@@ -378,14 +386,7 @@ public class Board {
     }
 
     public void makeNullMove() {
-        Undo u = new Undo();
-        u.move = -1;
-        u.castlingRights = castlingRights;
-        u.epSquare = epSquare;
-        u.halfmoveClock = halfmoveClock;
-        u.zobristKey = zobristKey;
-        u.capturedPieceCode = EMPTY;
-        history.push(u);
+        pushHistory(-1, EMPTY, castlingRights, epSquare, halfmoveClock, zobristKey);
 
         if (epSquare != -1) zobristKey ^= Zobrist.EP_FILE_KEY[epSquare & 7];
         epSquare = -1;
@@ -394,12 +395,12 @@ public class Board {
     }
 
     public void unmakeNullMove() {
-        Undo u = history.pop();
+        long state = historyState[--historySize];
         sideToMove = opposite(sideToMove);
-        castlingRights = u.castlingRights;
-        epSquare = u.epSquare;
-        halfmoveClock = u.halfmoveClock;
-        zobristKey = u.zobristKey;
+        castlingRights = (int) (state >>> 20) & 15;
+        epSquare = ((int) (state >>> 24) & 127) - 1;
+        halfmoveClock = (int) (state >>> 31);
+        zobristKey = historyKeys[historySize];
     }
 
     public void printBoard() {

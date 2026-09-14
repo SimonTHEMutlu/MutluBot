@@ -47,6 +47,11 @@ build.sh / build.bat     Build scripts (Linux/Mac and Windows)
 - **Search** ties `MoveGenerator`, `Evaluator`, and `TranspositionTable` together.
   It reports progress through a small `InfoListener` callback interface so
   `UCIEngine` can turn each completed depth into a UCI `info` line.
+- **TranspositionTable** stores each cached position in two primitive `long`
+  arrays (16 bytes per slot), so the configured hash size holds more positions
+  without allocating an object for every entry. The search probes these slots
+  without creating temporary objects. **Board** uses a one-byte-per-square
+  mailbox and a reusable, packed two-long undo record per ply.
 - **UCIEngine** is the only class that talks to stdin/stdout. Everything else is
   UI-agnostic, so you could drive `Board`/`Search` from a GUI, a test harness,
   or a different protocol without touching them.
@@ -112,6 +117,16 @@ recaptures, en passant, and promotion:
 javac --release 8 -cp out -d out test/engine/StaticExchangeTest.java
 java -cp out engine.StaticExchangeTest
 ```
+
+The position-storage tests cover packed table entries and make/unmake history:
+
+```bash
+javac --release 8 -cp out -d out test/engine/PositionStorageTest.java
+java -cp out engine.PositionStorageTest
+```
+
+For a fixed-depth search timing (start position by default), compile
+`test/engine/SearchBenchmark.java` and run `java -cp out engine.SearchBenchmark 10`.
 
 ## Setting it up in SCID vs PC
 

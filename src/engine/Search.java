@@ -222,14 +222,15 @@ public class Search {
 
         int origAlpha = alpha;
         int ttMove = Move.NONE;
-        TranspositionTable.Probe probe = tt.probe(board.zobristKey);
-        if (probe != null) {
-            ttMove = probe.move;
-            if (probe.depth >= depth) {
-                int score = adjustMateFromTT(probe.score, searchPly);
-                if (probe.flag == TranspositionTable.EXACT) return score;
-                if (probe.flag == TranspositionTable.LOWER_BOUND && score > alpha) alpha = score;
-                else if (probe.flag == TranspositionTable.UPPER_BOUND && score < beta) beta = score;
+        long entry = tt.probePacked(board.zobristKey);
+        if (entry != 0) {
+            ttMove = TranspositionTable.moveOf(entry);
+            if (TranspositionTable.depthOf(entry) >= depth) {
+                int score = adjustMateFromTT(TranspositionTable.scoreOf(entry), searchPly);
+                int flag = TranspositionTable.flagOf(entry);
+                if (flag == TranspositionTable.EXACT) return score;
+                if (flag == TranspositionTable.LOWER_BOUND && score > alpha) alpha = score;
+                else if (flag == TranspositionTable.UPPER_BOUND && score < beta) beta = score;
                 if (alpha >= beta) return score;
             }
         }

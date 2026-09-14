@@ -1,19 +1,22 @@
 package engine;
 
+import java.util.Arrays;
+
 public class TranspositionTable {
 
     public static final int EXACT = 0, LOWER_BOUND = 1, UPPER_BOUND = 2;
 
-    private static class Entry {
-        long key;
-        int depth;
-        int score;
-        int flag;
-        int move;
-        int age;
-    }
+    // One key and one packed value per slot: 16 bytes instead of an Entry
+    // object plus a reference. The valid bit permits a zero Zobrist key.
+    private static final long VALID = 1L << 58;
+    private static final int SCORE_SHIFT = 16;
+    private static final int DEPTH_SHIFT = 32;
+    private static final int FLAG_SHIFT = 40;
+    private static final int AGE_SHIFT = 42;
+    private static final long AGE_MASK = 0xffffL;
 
-    private Entry[] table;
+    private long[] keys;
+    private long[] values;
     private int mask;
     private int currentAge;
 
@@ -23,49 +26,76 @@ public class TranspositionTable {
 
     public void resize(int sizeMb) {
         long bytes = (long) sizeMb * 1024 * 1024;
-        long entryBytes = 40; // rough estimate per Entry object incl. overhead
-        int numEntries = (int) Math.max(1024, bytes / entryBytes);
-        int power = Integer.highestOneBit(numEntries);
-        table = new Entry[power];
+        long numEntries = Math.max(1024, bytes / (Long.BYTES * 2));
+        int power = Integer.highestOneBit((int) Math.min(numEntries, 1L << 30));
+        keys = new long[power];
+        values = new long[power];
         mask = power - 1;
         currentAge = 0;
     }
 
     public void clear() {
-        table = new Entry[table.length];
+        Arrays.fill(values, 0L);
         currentAge = 0;
     }
 
     public void newSearch() {
-        currentAge++;
+        // Clear before the 16-bit generation wraps, so stale entries cannot
+        // look as though they came from the current search.
+        if (++currentAge > AGE_MASK) clear();
     }
 
     public void store(long key, int depth, int score, int flag, int move) {
-        int idx = (int) (key & mask);
-        Entry e = table[idx];
-        if (e == null) {
-            e = new Entry();
-            table[idx] = e;
-        } else if (e.key == key && e.depth > depth && e.age == currentAge) {
-            // Keep deeper existing entry from the same search generation unless this is exact.
-            if (flag != EXACT) return;
+        int idx = (int) key & mask;
+        long old = values[idx];
+        if ((old & VALID) != 0 && keys[idx] == key
+                && depthOf(old) > depth && age(old) == currentAge && flag != EXACT) {
+            return;
         }
-        e.key = key;
-        e.depth = depth;
-        e.score = score;
-        e.flag = flag;
-        e.move = move;
-        e.age = currentAge;
+        // Engine depths fit in eight bits; scores stay within +/-32000.
+        long packed = VALID | ((long) move & 0xffffL)
+                | ((long) score & 0xffffL) << SCORE_SHIFT
+                | ((long) depth & 0xffL) << DEPTH_SHIFT
+                | ((long) flag & 3L) << FLAG_SHIFT
+                | ((long) currentAge & AGE_MASK) << AGE_SHIFT;
+        keys[idx] = key;
+        values[idx] = packed;
     }
 
-    /** Returns the entry for this key, or null if not present. Caller reads fields immediately (not thread-safe across probes). */
+    /** Returns the entry for this key, or null if not present. */
     public Probe probe(long key) {
-        int idx = (int) (key & mask);
-        Entry e = table[idx];
-        if (e != null && e.key == key) {
-            return new Probe(e.depth, e.score, e.flag, e.move);
+        long packed = probePacked(key);
+        if (packed != 0) {
+            return new Probe(depthOf(packed), scoreOf(packed), flagOf(packed), moveOf(packed));
         }
         return null;
+    }
+
+    /** Allocation-free lookup for the search hot path; zero means no entry. */
+    public long probePacked(long key) {
+        int idx = (int) key & mask;
+        long packed = values[idx];
+        return (packed & VALID) != 0 && keys[idx] == key ? packed : 0;
+    }
+
+    public static int depthOf(long packed) {
+        return (int) (packed >>> DEPTH_SHIFT) & 0xff;
+    }
+
+    public static int scoreOf(long packed) {
+        return (short) (packed >>> SCORE_SHIFT);
+    }
+
+    public static int flagOf(long packed) {
+        return (int) (packed >>> FLAG_SHIFT) & 3;
+    }
+
+    public static int moveOf(long packed) {
+        return (int) packed & 0xffff;
+    }
+
+    private static int age(long packed) {
+        return (int) (packed >>> AGE_SHIFT) & (int) AGE_MASK;
     }
 
     public static class Probe {
