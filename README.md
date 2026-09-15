@@ -23,7 +23,7 @@ src/engine/
   MoveGenerator.java     Pseudo-legal move generation + legal-move filtering
   MoveList.java             Lightweight growable move list (avoids boxing/ArrayList overhead)
   Zobrist.java              Random keys for Zobrist hashing
-  Evaluator.java             Static evaluation: material + piece-square tables
+  Evaluator.java             Tapered material/PST, bishop pair, pawns, king activity
   TranspositionTable.java  Hash table caching search results
   Search.java                Iterative deepening alpha-beta search with TT, killers,
                           history heuristic, null-move pruning, quiescence search
@@ -133,6 +133,14 @@ javac --release 8 -cp out -d out test/engine/SearchCorrectnessTest.java
 java -cp out engine.SearchCorrectnessTest
 ```
 
+The evaluator tests cover passed-pawn detection, advancement and king-support
+bonuses, endgame king centralization, enemy-pawn proximity, and symmetry:
+
+```bash
+javac --release 8 -cp out -d out test/engine/EvaluatorTest.java
+java -cp out engine.EvaluatorTest
+```
+
 For a fixed-depth search timing (start position by default), compile
 `test/engine/SearchBenchmark.java` and run `java -cp out engine.SearchBenchmark 10`.
 
@@ -200,9 +208,9 @@ This engine covers the essentials — bitboards, full legal move generation,
 alpha-beta with a transposition table, iterative deepening, and a working
 UCI loop — but plenty is left on the table on purpose:
 
-- **Evaluation** is material + static piece-square tables only. Big wins
-  available: tapered eval (blend separate midgame/endgame PSTs by game
-  phase), pawn structure (passed/isolated/doubled pawns), king safety,
+- **Evaluation** uses tapered material/piece-square scores, the bishop pair,
+  phase-aware passed-pawn bonuses, and endgame king-activity terms. Further gains may come from
+  isolated/doubled pawns and pawn chains, king safety,
   mobility, rook-on-open-file, bishop pair tuning, etc. `Evaluator.java` has
   a comment block listing these.
 - **Sliding piece attacks** use the classic ray + "first blocker via bitscan"

@@ -6,14 +6,13 @@ import static engine.Bitboards.*;
 
 
 /**
- * A deliberately simple evaluation function: material + piece-square tables.
- * This is the classic starting point for a chess engine. Good next steps to
- * strengthen it (left as an exercise for whoever builds on this):
- *   - Tapered evaluation (separate middlegame/endgame PSTs, blended by game phase)
- *   - Pawn structure (passed/isolated/doubled pawns, pawn chains)
+ * A deliberately simple tapered evaluation function: material, piece-square
+ * tables, bishop pair, passed pawns, and endgame king activity. Good next
+ * steps to strengthen it:
+ *   - More pawn structure (isolated/doubled pawns, pawn chains)
  *   - King safety (pawn shield, open files near king, attacker counts)
  *   - Mobility (number of legal-ish moves per piece)
- *   - Rook on open file / 7th rank, bishop pair bonus, knight outposts, etc.
+ *   - Rook on open file / 7th rank, knight outposts, etc.
  */
 public final class Evaluator {
     private Evaluator() {}
@@ -34,6 +33,19 @@ public final class Evaluator {
     private static final int PHASE_ROOK = 2;
     private static final int PHASE_QUEEN = 4;
     public static final int PHASE_MAX = 4 * PHASE_KNIGHT + 4 * PHASE_BISHOP + 4 * PHASE_ROOK + 2 * PHASE_QUEEN; // 24
+
+    // Passed-pawn bonuses indexed by relative rank: 1 = home rank, 6 = one
+    // step from promotion. Advancement matters more as pieces come off because
+    // there are fewer blockers and kings can support the pawn directly.
+    static final int[] PASSED_PAWN_MG_BONUS = {0, 0, 5, 12, 25, 45, 80, 0};
+    static final int[] PASSED_PAWN_EG_BONUS = {0, 5, 12, 25, 45, 80, 140, 0};
+    // Centipawns per square of closeness (7 - king distance) to an own passer.
+    // More advanced passers receive more value from direct king support.
+    static final int[] PASSED_PAWN_KING_PROXIMITY = {0, 1, 1, 2, 3, 4, 5, 0};
+    // Centipawns per square of closeness to each enemy pawn. This is added only
+    // to the endgame score and therefore fades out as non-pawn material returns.
+    static final int ENEMY_PAWN_KING_PROXIMITY = 2;
+    private static final long[][] PASSED_PAWN_MASK = new long[2][64];
 
     // Tables below are given in "a8..h8, a7..h7, ... a1..h1" reading order
     // (top of a printed board down to the bottom) and converted to our
@@ -161,14 +173,14 @@ public final class Evaluator {
     };
 
     private static final int[] KING_TABLE_RAW_EG = {
-              0,   0,   0,   0,   0,   0,   0,   0,
-              4,   7,   9,  10,  10,   9,   7,   4,
-              5,   8,  12,  16,  16,   12,  8,   5,
-              7,  10,  13,  20,  20,   13, 10,   7,
-              7,   7,   12,  15, 15,   12,  7,   7,
-              5,   5,   6,   7,   7,   6,   5,   5,
-              0,  10,   0,   0,   0,   0,  10,   0,
-              0,   0,   0,   0,   0,   0,   0,   0
+            -20, -10,   0,   5,   5,   0, -10, -20,
+            -10,   0,  10,  15,  15,  10,   0, -10,
+              0,  10,  20,  30,  30,  20,  10,   0,
+              5,  15,  30,  40,  40,  30,  15,   5,
+              5,  15,  30,  40,  40,  30,  15,   5,
+              0,  10,  20,  30,  30,  20,  10,   0,
+            -10,   0,  10,  15,  15,  10,   0, -10,
+            -20, -10,   0,   5,   5,   0, -10, -20
     };
 
 
@@ -194,12 +206,30 @@ static {
             PST_EG_BLACK[type][sq ^ 56] = rawEg[type][i];
         }
     }
+
+    // A pawn is passed when no enemy pawn is ahead of it on its own file or
+    // either adjacent file. Precompute those three-file forward spans so the
+    // evaluator only needs one bitboard intersection per pawn.
+    for (int sq = 0; sq < 64; sq++) {
+        int rank = sq >>> 3;
+        int file = sq & 7;
+        for (int targetFile = Math.max(0, file - 1); targetFile <= Math.min(7, file + 1); targetFile++) {
+            for (int targetRank = rank + 1; targetRank < 8; targetRank++) {
+                PASSED_PAWN_MASK[WHITE][sq] |= 1L << (targetRank * 8 + targetFile);
+            }
+            for (int targetRank = rank - 1; targetRank >= 0; targetRank--) {
+                PASSED_PAWN_MASK[BLACK][sq] |= 1L << (targetRank * 8 + targetFile);
+            }
+        }
+    }
 }
 
     /** Score is from the perspective of the side to move (positive = good for side to move). */
     public static int evaluate(Board b) {
     int mgScore = 0;
     int egScore = 0;
+    int whiteKingSq = b.kingSquare(WHITE);
+    int blackKingSq = b.kingSquare(BLACK);
 
     for (int type = 0; type < 6; type++) {
         int value = PIECE_VALUE[type];
@@ -210,6 +240,16 @@ static {
             wb &= wb - 1;
             mgScore += value + PST_MG_WHITE[type][sq];
             egScore += value + PST_EG_WHITE[type][sq];
+            if (type == PAWN) {
+                int relativeRank = sq >>> 3;
+                if (isPassedPawn(WHITE, b.pieceBB[BLACK][PAWN], sq)) {
+                    mgScore += PASSED_PAWN_MG_BONUS[relativeRank];
+                    egScore += PASSED_PAWN_EG_BONUS[relativeRank];
+                    egScore += kingProximity(whiteKingSq, sq)
+                            * PASSED_PAWN_KING_PROXIMITY[relativeRank];
+                }
+                egScore -= kingProximity(blackKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
+            }
         }
         long bb2 = b.pieceBB[BLACK][type];
         while (bb2 != 0) {
@@ -217,6 +257,16 @@ static {
             bb2 &= bb2 - 1;
             mgScore -= value + PST_MG_BLACK[type][sq];
             egScore -= value + PST_EG_BLACK[type][sq];
+            if (type == PAWN) {
+                int relativeRank = 7 - (sq >>> 3);
+                if (isPassedPawn(BLACK, b.pieceBB[WHITE][PAWN], sq)) {
+                    mgScore -= PASSED_PAWN_MG_BONUS[relativeRank];
+                    egScore -= PASSED_PAWN_EG_BONUS[relativeRank];
+                    egScore -= kingProximity(blackKingSq, sq)
+                            * PASSED_PAWN_KING_PROXIMITY[relativeRank];
+                }
+                egScore += kingProximity(whiteKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
+            }
         }
     }
 
@@ -227,6 +277,22 @@ static {
     int blended = (mgScore * phase + egScore * (PHASE_MAX - phase)) / PHASE_MAX;
 
     return b.sideToMove == WHITE ? blended : -blended;
+    }
+
+    /** Package-private for focused evaluator tests. */
+    static boolean isPassedPawn(Board b, int color, int sq) {
+        return isPassedPawn(color, b.pieceBB[opposite(color)][PAWN], sq);
+    }
+
+    private static boolean isPassedPawn(int color, long enemyPawns, int sq) {
+        return (PASSED_PAWN_MASK[color][sq] & enemyPawns) == 0;
+    }
+
+    /** Number of king moves saved versus the maximum possible distance of seven. */
+    private static int kingProximity(int kingSq, int pawnSq) {
+        int fileDistance = Math.abs((kingSq & 7) - (pawnSq & 7));
+        int rankDistance = Math.abs((kingSq >>> 3) - (pawnSq >>> 3));
+        return 7 - Math.max(fileDistance, rankDistance);
     }
 
     /** gamePhase is used in order to have multiple piece-square tables for different phases of the game */
