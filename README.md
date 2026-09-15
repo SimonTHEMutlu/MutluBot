@@ -125,6 +125,14 @@ javac --release 8 -cp out -d out test/engine/PositionStorageTest.java
 java -cp out engine.PositionStorageTest
 ```
 
+The search-correctness tests cover checked quiescence positions, quiet
+promotions, and repetition history:
+
+```bash
+javac --release 8 -cp out -d out test/engine/SearchCorrectnessTest.java
+java -cp out engine.SearchCorrectnessTest
+```
+
 For a fixed-depth search timing (start position by default), compile
 `test/engine/SearchBenchmark.java` and run `java -cp out engine.SearchBenchmark 10`.
 

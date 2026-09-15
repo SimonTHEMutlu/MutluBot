@@ -9,8 +9,8 @@ public class MoveGenerator {
      * Generates pseudo-legal moves (does not check whether the moving side's
      * own king is left in check). Use generateLegalMoves for fully legal moves.
      *
-     * @param capturesOnly if true, only generates captures / capture-promotions
-     *                     (used by quiescence search); quiet moves are skipped.
+     * @param capturesOnly if true, only generates captures and promotions
+     *                     (used by quiescence search); other quiet moves are skipped.
      */
     public static void generatePseudoLegal(Board b, MoveList list, boolean capturesOnly) {
         int us = b.sideToMove;
@@ -93,10 +93,10 @@ public class MoveGenerator {
             p &= p - 1;
             int to1 = from + forward;
 
-            if (!capturesOnly && to1 >= 0 && to1 < 64 && ((all >>> to1) & 1L) == 0) {
+            if (to1 >= 0 && to1 < 64 && ((all >>> to1) & 1L) == 0) {
                 if (((1L << to1) & promoRank) != 0) {
                     addPromotions(list, from, to1, false);
-                } else {
+                } else if (!capturesOnly) {
                     list.add(Move.encode(from, to1, Move.QUIET));
                     if (((1L << from) & startRank) != 0) {
                         int to2 = from + 2 * forward;

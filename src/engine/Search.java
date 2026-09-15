@@ -62,8 +62,9 @@ public class Search {
      *
      * @param maxDepth       depth limit, or <= 0 for "no explicit depth limit"
      * @param timeMillis     time budget in ms, or < 0 for "no time limit" (rely on stop()/maxDepth)
-     * @param gameHistoryKeys zobrist keys of all positions played so far in the actual game
-     *                        (oldest first), used for accurate repetition detection; may be null
+     * @param gameHistoryKeys zobrist keys of positions played so far in the actual game
+     *                        (oldest first), used for accurate repetition detection; may be null.
+     *                        The current root may be present as the final entry.
      */
     public int search(Board board, int maxDepth, long timeMillis, long[] gameHistoryKeys) {
         stopRequested = false;
@@ -71,9 +72,14 @@ public class Search {
         for (int[] k : killerMoves) Arrays.fill(k, Move.NONE);
         for (int[] row : historyTable) Arrays.fill(row, 0);
 
-        historyBase = gameHistoryKeys != null ? gameHistoryKeys.length : 0;
+        int historyLength = gameHistoryKeys != null ? gameHistoryKeys.length : 0;
+        boolean historyIncludesRoot = historyLength > 0
+                && gameHistoryKeys[historyLength - 1] == board.zobristKey;
+        historyBase = historyIncludesRoot ? historyLength - 1 : historyLength;
         keyStack = new long[historyBase + MAX_PLY + 8];
-        if (gameHistoryKeys != null) System.arraycopy(gameHistoryKeys, 0, keyStack, 0, historyBase);
+        if (gameHistoryKeys != null && historyBase > 0) {
+            System.arraycopy(gameHistoryKeys, 0, keyStack, 0, historyBase);
+        }
 
         timeLimited = timeMillis >= 0;
         long startNanos = System.nanoTime();
@@ -205,7 +211,11 @@ public class Search {
 
         int absPly = historyBase + searchPly;
         keyStack[absPly] = board.zobristKey;
-        if (board.halfmoveClock >= 100) return 0;
+        if (board.halfmoveClock >= 100) {
+            boolean checked = board.isInCheck(board.sideToMove);
+            if (!checked || MoveGenerator.hasLegalMove(board)) return 0;
+            return -(MATE_SCORE - searchPly);
+        }
         int repetitions = 0;
         for (int p = absPly - 2; p >= 0; p -= 2) {
         if (keyStack[p] == board.zobristKey) {
@@ -322,15 +332,22 @@ public class Search {
 
         if (searchPly >= MAX_PLY - 1) return Evaluator.evaluate(board);
 
-        int standPat = Evaluator.evaluate(board);
-        if (standPat >= beta) return beta;
-        if (standPat > alpha) alpha = standPat;
+        boolean inCheck = board.isInCheck(board.sideToMove);
+        int standPat = -INFINITY_SCORE;
+        if (!inCheck) {
+            standPat = Evaluator.evaluate(board);
+            if (standPat >= beta) return beta;
+            if (standPat > alpha) alpha = standPat;
+        }
 
         MoveList moves = new MoveList();
-        MoveGenerator.generatePseudoLegal(board, moves, true);
-        int[] scores = orderCaptures(board, moves);
+        MoveGenerator.generatePseudoLegal(board, moves, !inCheck);
+        int[] scores = inCheck
+                ? orderMoves(board, moves, Move.NONE, searchPly)
+                : orderCaptures(board, moves);
 
         int us = board.sideToMove;
+        int legalCount = 0;
         for (int i = 0; i < moves.size; i++) {
             int bestIdx = i;
             for (int j = i + 1; j < moves.size; j++) if (scores[j] > scores[bestIdx]) bestIdx = j;
@@ -343,7 +360,7 @@ public class Search {
             // A capture that cannot lift alpha need not be searched unless it gives check.
             // Promotions, en passant, and king captures have tactical edge cases, so keep them.
             boolean prune = false;
-            if (!Move.isPromotion(move) && !Move.isEnPassant(move)
+            if (!inCheck && !Move.isPromotion(move) && !Move.isEnPassant(move)
                     && board.pieceTypeAt(Move.from(move)) != KING
                     && Math.abs(alpha) < MATE_SCORE - MAX_PLY) {
                 int victim = board.pieceTypeAt(Move.to(move));
@@ -360,6 +377,7 @@ public class Search {
                 board.unmakeMove();
                 continue;
             }
+            legalCount++;
             if (prune && !board.isInCheck(board.sideToMove)) {
                 board.unmakeMove();
                 continue;
@@ -371,6 +389,7 @@ public class Search {
             if (score >= beta) return beta;
             if (score > alpha) alpha = score;
         }
+        if (inCheck && legalCount == 0) return -(MATE_SCORE - searchPly);
         return alpha;
     }
 
