@@ -27,6 +27,9 @@ public class Search {
     private final int[][] killerMoves = new int[MAX_PLY][2];
     private final int[][] historyTable = new int[64][64];
     private final int[][] seeGains = new int[MAX_PLY][32];
+    // Each recursion level owns reusable buffers so nodes do not create garbage.
+    private final MoveList[] moveLists = new MoveList[MAX_PLY];
+    private final int[][] moveScores = new int[MAX_PLY][256];
     private long[] keyStack;
     private int historyBase;
 
@@ -47,6 +50,9 @@ public class Search {
 
     public Search(TranspositionTable tt) {
         this.tt = tt;
+        for (int ply = 0; ply < MAX_PLY; ply++) {
+            moveLists[ply] = new MoveList();
+        }
     }
 
     public void setInfoListener(InfoListener l) {
@@ -253,9 +259,11 @@ public class Search {
             if (score >= beta) return beta;
         }
 
-        MoveList moves = new MoveList();
+        MoveList moves = moveLists[searchPly];
+        moves.clear();
         MoveGenerator.generatePseudoLegal(board, moves, false);
-        int[] scores = orderMoves(board, moves, ttMove, searchPly);
+        int[] scores = scoreBuffer(searchPly, moves.size);
+        scoreMoves(board, moves, ttMove, searchPly, scores);
 
         int legalCount = 0;
         int bestScore = -INFINITY_SCORE;
@@ -340,11 +348,12 @@ public class Search {
             if (standPat > alpha) alpha = standPat;
         }
 
-        MoveList moves = new MoveList();
+        MoveList moves = moveLists[searchPly];
+        moves.clear();
         MoveGenerator.generatePseudoLegal(board, moves, !inCheck);
-        int[] scores = inCheck
-                ? orderMoves(board, moves, Move.NONE, searchPly)
-                : orderCaptures(board, moves);
+        int[] scores = scoreBuffer(searchPly, moves.size);
+        if (inCheck) scoreMoves(board, moves, Move.NONE, searchPly, scores);
+        else scoreCaptures(board, moves, scores);
 
         int us = board.sideToMove;
         int legalCount = 0;
@@ -393,8 +402,19 @@ public class Search {
         return alpha;
     }
 
-    private int[] orderMoves(Board board, MoveList moves, int ttMove, int searchPly) {
-        int[] scores = new int[moves.size];
+    private int[] scoreBuffer(int searchPly, int requiredSize) {
+        int[] scores = moveScores[searchPly];
+        if (requiredSize > scores.length) {
+            int newSize = scores.length;
+            while (newSize < requiredSize) newSize *= 2;
+            scores = Arrays.copyOf(scores, newSize);
+            moveScores[searchPly] = scores;
+        }
+        return scores;
+    }
+
+    private void scoreMoves(Board board, MoveList moves, int ttMove,
+                            int searchPly, int[] scores) {
         for (int i = 0; i < moves.size; i++) {
             int move = moves.get(i);
             if (move == ttMove) {
@@ -411,15 +431,12 @@ public class Search {
                 scores[i] = historyTable[Move.from(move)][Move.to(move)];
             }
         }
-        return scores;
     }
 
-    private int[] orderCaptures(Board board, MoveList moves) {
-        int[] scores = new int[moves.size];
+    private void scoreCaptures(Board board, MoveList moves, int[] scores) {
         for (int i = 0; i < moves.size; i++) {
             scores[i] = mvvLva(board, moves.get(i));
         }
-        return scores;
     }
 
     private int mvvLva(Board board, int move) {
