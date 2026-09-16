@@ -12,6 +12,13 @@ public final class EvaluatorTest {
         testEndgameKingCentralization();
         testOwnPassedPawnProximity();
         testEnemyPawnProximityAndPhaseTaper();
+        testSafeMobilityByPiece();
+        testEnemyPawnControlledMobilityIsExcluded();
+        testRawPinnedMobilityIsIntentional();
+        testPerAttackerKingRingControl();
+        testKingPressureCap();
+        testKingPressureIsMiddlegameOnly();
+        testActivityColorSymmetry();
         testColorAndSideToMoveSymmetry();
         System.out.println("EvaluatorTest passed");
     }
@@ -64,7 +71,8 @@ public final class EvaluatorTest {
         Board blockedMiddlegame = board("nnbbrrqk/5p2/3p4/2P5/8/8/5P2/KQRRBBNN w - - 0 1");
         Board passedMiddlegame = board("nnbbrrqk/5p2/4p3/2P5/8/8/5P2/KQRRBBNN w - - 0 1");
         check(Evaluator.gamePhase(passedMiddlegame) == Evaluator.PHASE_MAX, "full middlegame phase");
-        check(Evaluator.evaluate(passedMiddlegame) - Evaluator.evaluate(blockedMiddlegame) == 25,
+        check(evaluateWithoutActivity(passedMiddlegame)
+                        - evaluateWithoutActivity(blockedMiddlegame) == 25,
                 "fourth-rank middlegame passer bonus is applied");
     }
 
@@ -95,8 +103,76 @@ public final class EvaluatorTest {
         Board fartherMiddlegame = board("nnbbrrqk/8/p7/8/4K3/8/8/1QRRBBNN w - - 0 1");
         check(Evaluator.gamePhase(closerMiddlegame) == Evaluator.PHASE_MAX,
                 "proximity taper test has full middlegame phase");
-        check(Evaluator.evaluate(closerMiddlegame) == Evaluator.evaluate(fartherMiddlegame),
+        check(evaluateWithoutActivity(closerMiddlegame)
+                        == evaluateWithoutActivity(fartherMiddlegame),
                 "enemy-pawn proximity is fully tapered out in the middlegame");
+    }
+
+    private static void testSafeMobilityByPiece() {
+        check(Evaluator.safeMobilityCount(
+                        board("k7/8/8/8/3N4/8/8/7K w - - 0 1"), WHITE, Piece.KNIGHT) == 8,
+                "central knight has eight safe mobility squares");
+        check(Evaluator.safeMobilityCount(
+                        board("k7/8/8/8/3B4/8/8/7K w - - 0 1"), WHITE, Piece.BISHOP) == 13,
+                "central bishop has thirteen safe mobility squares");
+        check(Evaluator.safeMobilityCount(
+                        board("k7/8/8/8/3R4/8/8/7K w - - 0 1"), WHITE, Piece.ROOK) == 14,
+                "central rook has fourteen safe mobility squares");
+        check(Evaluator.safeMobilityCount(
+                        board("k7/8/8/8/3Q4/8/8/7K w - - 0 1"), WHITE, Piece.QUEEN) == 27,
+                "central queen has twenty-seven safe mobility squares");
+    }
+
+    private static void testEnemyPawnControlledMobilityIsExcluded() {
+        Board board = board("k7/8/4p3/8/3N4/8/8/7K w - - 0 1");
+        check(Evaluator.safeMobilityCount(board, WHITE, Piece.KNIGHT) == 7,
+                "enemy-pawn-controlled knight destination is excluded");
+    }
+
+    private static void testRawPinnedMobilityIsIntentional() {
+        Board board = board("4r1k1/8/8/8/8/8/4N3/4K3 w - - 0 1");
+        check(Evaluator.safeMobilityCount(board, WHITE, Piece.KNIGHT) == 6,
+                "raw mobility intentionally includes a pinned knight's destinations");
+    }
+
+    private static void testPerAttackerKingRingControl() {
+        Board oneKnight = board("7k/8/5N2/8/8/8/8/K7 w - - 0 1");
+        Board overlappingKnight = board("5N1k/8/5N2/8/8/8/8/K7 w - - 0 1");
+        check(Evaluator.kingPressureMg(oneKnight, WHITE) == 2,
+                "one knight scores one point for each controlled ring square");
+        check(Evaluator.kingPressureMg(overlappingKnight, WHITE) == 3,
+                "overlapping control by a second attacker is counted directly");
+    }
+
+    private static void testKingPressureCap() {
+        Board board = board("4NN1k/4N3/4NNQN/5NNN/8/8/8/K7 w - - 0 1");
+        check(Evaluator.kingPressureMg(board, WHITE) == 8,
+                "direct king pressure is capped at eight centipawns");
+    }
+
+    private static void testKingPressureIsMiddlegameOnly() {
+        Board pawnPressure = board("7k/8/5P2/8/8/8/8/K7 w - - 0 1");
+        check(Evaluator.kingPressureMg(pawnPressure, WHITE) == 1,
+                "pawn control contributes once to direct king-ring pressure");
+        long terms = Evaluator.activityTerms(pawnPressure);
+        int middlegame = (int) (terms >> 32);
+        int endgame = (int) terms;
+        check(middlegame == 0, "pure-endgame king pressure work is skipped");
+        check(endgame == 0, "king pressure is fully tapered out of pure endgames");
+        check(Evaluator.gamePhase(pawnPressure) == 0, "pawn pressure test is pure endgame phase");
+    }
+
+    private static void testActivityColorSymmetry() {
+        Board whiteAttack = board("7k/8/5N2/8/8/8/8/K7 w - - 0 1");
+        Board blackAttack = board("k7/8/8/8/8/5n2/8/7K b - - 0 1");
+        long whiteTerms = Evaluator.activityTerms(whiteAttack);
+        long blackTerms = Evaluator.activityTerms(blackAttack);
+        check((int) (whiteTerms >> 32) == -(int) (blackTerms >> 32),
+                "middlegame activity is color-mirror symmetric");
+        check((int) whiteTerms == -(int) blackTerms,
+                "endgame activity is color-mirror symmetric");
+        check(Evaluator.evaluate(whiteAttack) == Evaluator.evaluate(blackAttack),
+                "mirrored activity has the same side-to-move score");
     }
 
     private static void testColorAndSideToMoveSymmetry() {
@@ -117,6 +193,15 @@ public final class EvaluatorTest {
 
     private static int square(String name) {
         return Bitboards.squareFromName(name);
+    }
+
+    private static int evaluateWithoutActivity(Board board) {
+        long terms = Evaluator.activityTerms(board);
+        int phase = Evaluator.gamePhase(board);
+        int activity = ((int) (terms >> 32) * phase
+                + (int) terms * (Evaluator.PHASE_MAX - phase)) / Evaluator.PHASE_MAX;
+        if (board.sideToMove == BLACK) activity = -activity;
+        return Evaluator.evaluate(board) - activity;
     }
 
     private static void check(boolean condition, String message) {

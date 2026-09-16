@@ -7,11 +7,11 @@ import static engine.Bitboards.*;
 
 /**
  * A deliberately simple tapered evaluation function: material, piece-square
- * tables, bishop pair, passed pawns, and endgame king activity. Good next
- * steps to strengthen it:
+ * tables, bishop pair, passed pawns, endgame king activity, and deliberately
+ * small pawn/knight activity and king-pressure terms. Good next steps:
  *   - More pawn structure (isolated/doubled pawns, pawn chains)
- *   - King safety (pawn shield, open files near king, attacker counts)
- *   - Mobility (number of legal-ish moves per piece)
+ *   - Broader king safety (pawn shield, open files near king, attacker counts)
+ *   - Broader mobility, if it can meet the evaluator performance budget
  *   - Rook on open file / 7th rank, knight outposts, etc.
  */
 public final class Evaluator {
@@ -46,6 +46,24 @@ public final class Evaluator {
     // to the endgame score and therefore fades out as non-pawn material returns.
     static final int ENEMY_PAWN_KING_PROXIMITY = 2;
     private static final long[][] PASSED_PAWN_MASK = new long[2][64];
+
+    // Modest, allocation-free activity terms. Pawns and kings deliberately
+    // receive no mobility score: pawn pushes require move-generation logic and
+    // pseudo-legal king mobility would reward moves into attacked squares.
+    // The full N/B/R/Q candidate missed the performance and node-stability
+    // gates. Keep only the cheap knight signal in production; the generic
+    // attack helpers remain available to focused tests.
+    private static final int[] MOBILITY_MG_WEIGHT = {0, 1, 0, 0, 0, 0};
+    private static final int[] MOBILITY_EG_WEIGHT = {0, 0, 0, 0, 0, 0};
+    // Middlegame points per king-ring square controlled by each attacker. Direct
+    // pressure is symmetric: attacks near our king are subtracted when the
+    // opponent's pressure is removed from our own pressure.
+    // Likewise, retain only pawn and knight pressure. Scaling the symmetric net
+    // term keeps the feature below the search-instability threshold observed in
+    // the broader experiments while still allowing real non-zero contributions.
+    private static final int[] KING_RING_MG_WEIGHT = {1, 1, 0, 0, 0, 0};
+    private static final int KING_PRESSURE_MG_CAP = 8;
+    private static final int ACTIVITY_SCALE = 8;
 
     // Tables below are given in "a8..h8, a7..h7, ... a1..h1" reading order
     // (top of a printed board down to the bottom) and converted to our
@@ -274,6 +292,10 @@ static {
     if (popcount(b.pieceBB[BLACK][BISHOP]) >= 2) { mgScore -= 30; egScore -= 30; }
 
     int phase = gamePhase(b);
+    long activity = activityTerms(b, phase);
+    mgScore += (int) (activity >> 32);
+    egScore += (int) activity;
+
     int blended = (mgScore * phase + egScore * (PHASE_MAX - phase)) / PHASE_MAX;
 
     return b.sideToMove == WHITE ? blended : -blended;
@@ -286,6 +308,128 @@ static {
 
     private static boolean isPassedPawn(int color, long enemyPawns, int sq) {
         return (PASSED_PAWN_MASK[color][sq] & enemyPawns) == 0;
+    }
+
+    /**
+     * Returns the white-relative activity terms packed as MG in the high int
+     * and EG in the low int. This is package-private for focused evaluator
+     * tests; the search hot path unpacks it without allocating an object.
+     */
+    static long activityTerms(Board b) {
+        return activityTerms(b, gamePhase(b));
+    }
+
+    private static long activityTerms(Board b, int phase) {
+        // With no non-pawn material there is no N/B/R/Q mobility, and the
+        // middlegame-only king-pressure term would be fully tapered out.
+        if (phase == 0) return 0L;
+
+        int whiteMg = 0, blackMg = 0;
+        int whiteEg = 0, blackEg = 0;
+
+        int whiteKingSq = b.kingSquare(WHITE);
+        int blackKingSq = b.kingSquare(BLACK);
+        long whiteKingRing = KING_ATTACKS[whiteKingSq];
+        long blackKingRing = KING_ATTACKS[blackKingSq];
+
+        long whitePawnControls = pawnControlMap(b.pieceBB[WHITE][PAWN], WHITE);
+        long blackPawnControls = pawnControlMap(b.pieceBB[BLACK][PAWN], BLACK);
+        long whiteMobilityArea = ~b.occupancy[WHITE] & ~blackPawnControls;
+        long blackMobilityArea = ~b.occupancy[BLACK] & ~whitePawnControls;
+
+        int whitePressure = popcount(whitePawnControls & blackKingRing)
+                * KING_RING_MG_WEIGHT[PAWN];
+        int blackPressure = popcount(blackPawnControls & whiteKingRing)
+                * KING_RING_MG_WEIGHT[PAWN];
+
+        for (int type = KNIGHT; type <= QUEEN; type++) {
+            if (MOBILITY_MG_WEIGHT[type] == 0 && MOBILITY_EG_WEIGHT[type] == 0
+                    && KING_RING_MG_WEIGHT[type] == 0) continue;
+            long pieces = b.pieceBB[WHITE][type];
+            while (pieces != 0) {
+                int sq = lsb(pieces);
+                pieces &= pieces - 1;
+                long attacks = pieceAttacks(type, sq, b.allOccupancy);
+                int mobility = popcount(attacks & whiteMobilityArea);
+                whiteMg += mobility * MOBILITY_MG_WEIGHT[type];
+                whiteEg += mobility * MOBILITY_EG_WEIGHT[type];
+                whitePressure += popcount(attacks & blackKingRing)
+                        * KING_RING_MG_WEIGHT[type];
+            }
+
+            pieces = b.pieceBB[BLACK][type];
+            while (pieces != 0) {
+                int sq = lsb(pieces);
+                pieces &= pieces - 1;
+                long attacks = pieceAttacks(type, sq, b.allOccupancy);
+                int mobility = popcount(attacks & blackMobilityArea);
+                blackMg += mobility * MOBILITY_MG_WEIGHT[type];
+                blackEg += mobility * MOBILITY_EG_WEIGHT[type];
+                blackPressure += popcount(attacks & whiteKingRing)
+                        * KING_RING_MG_WEIGHT[type];
+            }
+        }
+
+        whitePressure = Math.min(whitePressure, KING_PRESSURE_MG_CAP);
+        blackPressure = Math.min(blackPressure, KING_PRESSURE_MG_CAP);
+
+        int mg = (whiteMg - blackMg + whitePressure - blackPressure) / ACTIVITY_SCALE;
+        int eg = (whiteEg - blackEg) / ACTIVITY_SCALE;
+        return ((long) mg << 32) | (eg & 0xffffffffL);
+    }
+
+    /** Total safe pseudo-mobility for one non-pawn, non-king piece type. */
+    static int safeMobilityCount(Board b, int color, int type) {
+        if (type < KNIGHT || type > QUEEN) return 0;
+        long enemyPawnControls = pawnControlMap(b.pieceBB[opposite(color)][PAWN], opposite(color));
+        long mobilityArea = ~b.occupancy[color] & ~enemyPawnControls;
+        int count = 0;
+        long pieces = b.pieceBB[color][type];
+        while (pieces != 0) {
+            int sq = lsb(pieces);
+            pieces &= pieces - 1;
+            long attacks = pieceAttacks(type, sq, b.allOccupancy);
+            count += popcount(attacks & mobilityArea);
+        }
+        return count;
+    }
+
+    /** Package-private reference calculation used only by focused tests. */
+    static int kingPressureMg(Board b, int attackingColor) {
+        int defendingColor = opposite(attackingColor);
+        int defendingKingSq = b.kingSquare(defendingColor);
+        long attackingPawnControls = pawnControlMap(b.pieceBB[attackingColor][PAWN], attackingColor);
+        long defendingKingRing = KING_ATTACKS[defendingKingSq];
+        int pressure = popcount(attackingPawnControls & defendingKingRing)
+                * KING_RING_MG_WEIGHT[PAWN];
+
+        for (int type = KNIGHT; type <= QUEEN; type++) {
+            long pieces = b.pieceBB[attackingColor][type];
+            while (pieces != 0) {
+                int sq = lsb(pieces);
+                pieces &= pieces - 1;
+                pressure += popcount(pieceAttacks(type, sq, b.allOccupancy) & defendingKingRing)
+                        * KING_RING_MG_WEIGHT[type];
+            }
+        }
+        return Math.min(pressure, KING_PRESSURE_MG_CAP);
+    }
+
+    private static long pieceAttacks(int type, int sq, long occupancy) {
+        switch (type) {
+            case KNIGHT: return KNIGHT_ATTACKS[sq];
+            case BISHOP: return bishopAttacks(sq, occupancy);
+            case ROOK: return rookAttacks(sq, occupancy);
+            case QUEEN: return queenAttacks(sq, occupancy);
+            default: return 0L;
+        }
+    }
+
+    private static long pawnControlMap(long pawns, int color) {
+        if (color == WHITE) {
+            return ((pawns & ~FILE_A) << 7) | ((pawns & ~FILE_H) << 9);
+        }
+        return ((pawns & ~FILE_H) >>> 7) | ((pawns & ~FILE_A) >>> 9);
     }
 
     /** Number of king moves saved versus the maximum possible distance of seven. */
