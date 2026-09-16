@@ -36,12 +36,179 @@ public class Search {
 
     private volatile boolean stopRequested;
     private long nodes;
+    private long mainSearchNodes;
+    private long quiescenceNodes;
+    private long evaluatorCalls;
+    private long maxSelectiveDepth;
+    private long ttProbes;
+    private long ttHits;
+    private long ttExactHits;
+    private long ttMoveAvailable;
+    private long ttBoundCutoffs;
+    private long mainSearchBetaCutoffs;
+    private long quiescenceBetaCutoffs;
+    private long firstMoveCutoffs;
+    private long legalMovesSearched;
+    private long lmrAttempts;
+    private long lmrReducedSearches;
+    private long lmrFullDepthResearches;
+    private long seeCalls;
+    private long mainTieBreakSeeCalls;
+    private long qPruneSeeCalls;
+    private long mainSeeDemotions;
+    private long nullMoveAttempts;
+    private long nullMoveCutoffs;
+    private long aspirationRetries;
+    private long repetitionExits;
+    private long fiftyMoveExits;
     private long deadlineNanos;
     private boolean timeLimited;
 
     private int rootBestMove;
     private int iterationBestMove;
     private int selDepth;
+    private SearchStats lastStats = SearchStats.empty();
+
+    /** Immutable counters captured after the most recent completed search call. */
+    public static final class SearchStats {
+        public final long totalNodes;
+        public final long mainSearchNodes;
+        public final long quiescenceNodes;
+        public final long evaluatorCalls;
+        public final long maxSelectiveDepth;
+        public final long ttProbes;
+        public final long ttHits;
+        public final long ttExactHits;
+        public final long ttMoveAvailable;
+        public final long ttBoundCutoffs;
+        public final long mainSearchBetaCutoffs;
+        public final long quiescenceBetaCutoffs;
+        public final long betaCutoffs;
+        public final long firstMoveCutoffs;
+        public final long legalMovesSearched;
+        public final long lmrAttempts;
+        public final long lmrReducedSearches;
+        public final long lmrFullDepthResearches;
+        public final long seeCalls;
+        public final long mainTieBreakSeeCalls;
+        /** @deprecated use mainTieBreakSeeCalls. */
+        public final long mainOrderSeeCalls;
+        public final long qPruneSeeCalls;
+        public final long mainSeeDemotions;
+        public final long nullMoveAttempts;
+        public final long nullMoveCutoffs;
+        public final long aspirationRetries;
+        public final long repetitionExits;
+        public final long fiftyMoveExits;
+        public final boolean instrumentationEnabled;
+
+        private SearchStats(long totalNodes, long mainSearchNodes, long quiescenceNodes,
+                            long evaluatorCalls, long maxSelectiveDepth, long ttProbes,
+                            long ttHits, long ttExactHits, long ttMoveAvailable,
+                            long ttBoundCutoffs, long mainSearchBetaCutoffs,
+                            long quiescenceBetaCutoffs, long firstMoveCutoffs,
+                            long legalMovesSearched, long lmrAttempts, long lmrReducedSearches,
+                            long lmrFullDepthResearches, long seeCalls, long mainTieBreakSeeCalls,
+                            long qPruneSeeCalls, long mainSeeDemotions, long nullMoveAttempts,
+                            long nullMoveCutoffs, long aspirationRetries, long repetitionExits,
+                            long fiftyMoveExits, boolean instrumentationEnabled) {
+            this.totalNodes = totalNodes;
+            this.mainSearchNodes = mainSearchNodes;
+            this.quiescenceNodes = quiescenceNodes;
+            this.evaluatorCalls = evaluatorCalls;
+            this.maxSelectiveDepth = maxSelectiveDepth;
+            this.ttProbes = ttProbes;
+            this.ttHits = ttHits;
+            this.ttExactHits = ttExactHits;
+            this.ttMoveAvailable = ttMoveAvailable;
+            this.ttBoundCutoffs = ttBoundCutoffs;
+            this.mainSearchBetaCutoffs = mainSearchBetaCutoffs;
+            this.quiescenceBetaCutoffs = quiescenceBetaCutoffs;
+            this.betaCutoffs = mainSearchBetaCutoffs + quiescenceBetaCutoffs;
+            this.firstMoveCutoffs = firstMoveCutoffs;
+            this.legalMovesSearched = legalMovesSearched;
+            this.lmrAttempts = lmrAttempts;
+            this.lmrReducedSearches = lmrReducedSearches;
+            this.lmrFullDepthResearches = lmrFullDepthResearches;
+            this.seeCalls = seeCalls;
+            this.mainTieBreakSeeCalls = mainTieBreakSeeCalls;
+            this.mainOrderSeeCalls = mainTieBreakSeeCalls;
+            this.qPruneSeeCalls = qPruneSeeCalls;
+            this.mainSeeDemotions = mainSeeDemotions;
+            this.nullMoveAttempts = nullMoveAttempts;
+            this.nullMoveCutoffs = nullMoveCutoffs;
+            this.aspirationRetries = aspirationRetries;
+            this.repetitionExits = repetitionExits;
+            this.fiftyMoveExits = fiftyMoveExits;
+            this.instrumentationEnabled = instrumentationEnabled;
+        }
+
+        private static SearchStats empty() {
+            return new SearchStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+        }
+
+        private static SearchStats capture(Search search) {
+            boolean enabled = search.instrumentationEnabled;
+            return new SearchStats(search.nodes,
+                    enabled ? search.mainSearchNodes : 0,
+                    enabled ? search.quiescenceNodes : 0,
+                    enabled ? search.evaluatorCalls : 0,
+                    search.maxSelectiveDepth,
+                    enabled ? search.ttProbes : 0,
+                    enabled ? search.ttHits : 0,
+                    enabled ? search.ttExactHits : 0,
+                    enabled ? search.ttMoveAvailable : 0,
+                    enabled ? search.ttBoundCutoffs : 0,
+                    enabled ? search.mainSearchBetaCutoffs : 0,
+                    enabled ? search.quiescenceBetaCutoffs : 0,
+                    enabled ? search.firstMoveCutoffs : 0,
+                    enabled ? search.legalMovesSearched : 0,
+                    enabled ? search.lmrAttempts : 0,
+                    enabled ? search.lmrReducedSearches : 0,
+                    enabled ? search.lmrFullDepthResearches : 0,
+                    enabled ? search.seeCalls : 0,
+                    enabled ? search.mainTieBreakSeeCalls : 0,
+                    enabled ? search.qPruneSeeCalls : 0,
+                    enabled ? search.mainSeeDemotions : 0,
+                    enabled ? search.nullMoveAttempts : 0,
+                    enabled ? search.nullMoveCutoffs : 0,
+                    enabled ? search.aspirationRetries : 0,
+                    enabled ? search.repetitionExits : 0,
+                    enabled ? search.fiftyMoveExits : 0,
+                    enabled);
+        }
+
+        /** Compact key/value form suitable for benchmark logs and scripts. */
+        public String toSummary() {
+            return "mainNodes=" + mainSearchNodes
+                    + " qNodes=" + quiescenceNodes
+                    + " evalCalls=" + evaluatorCalls
+                    + " seldepth=" + maxSelectiveDepth
+                    + " ttProbes=" + ttProbes
+                    + " ttHits=" + ttHits
+                    + " ttExactHits=" + ttExactHits
+                    + " ttMoves=" + ttMoveAvailable
+                    + " ttBoundCutoffs=" + ttBoundCutoffs
+                    + " mainBetaCutoffs=" + mainSearchBetaCutoffs
+                    + " qBetaCutoffs=" + quiescenceBetaCutoffs
+                    + " betaCutoffs=" + betaCutoffs
+                    + " firstMoveCutoffs=" + firstMoveCutoffs
+                    + " legalMoves=" + legalMovesSearched
+                    + " lmrAttempts=" + lmrAttempts
+                    + " lmrReduced=" + lmrReducedSearches
+                    + " lmrResearch=" + lmrFullDepthResearches
+                    + " seeCalls=" + seeCalls
+                    + " mainTieBreakSeeCalls=" + mainTieBreakSeeCalls
+                    + " qSeePruneCalls=" + qPruneSeeCalls
+                    + " mainSeeDemotions=" + mainSeeDemotions
+                    + " nullAttempts=" + nullMoveAttempts
+                    + " nullCutoffs=" + nullMoveCutoffs
+                    + " aspirationRetries=" + aspirationRetries
+                    + " repetitionExits=" + repetitionExits
+                    + " fiftyMoveExits=" + fiftyMoveExits;
+        }
+    }
 
     public interface InfoListener {
         void onInfo(int depth, int seldepth, int scoreCp, boolean isMate, int mateIn,
@@ -49,6 +216,7 @@ public class Search {
     }
 
     private InfoListener listener;
+    private boolean instrumentationEnabled;
 
     public Search(TranspositionTable tt) {
         this.tt = tt;
@@ -65,6 +233,21 @@ public class Search {
         stopRequested = true;
     }
 
+    /** Enables detailed counters. Disabled by default to keep normal play fast. */
+    public void setInstrumentationEnabled(boolean enabled) {
+        instrumentationEnabled = enabled;
+    }
+
+    /**
+     * Returns an immutable snapshot from the most recent search call. When
+     * instrumentation is disabled, totalNodes and maxSelectiveDepth remain
+     * available, while detailed counters are zero and instrumentationEnabled
+     * is false.
+     */
+    public SearchStats getLastStats() {
+        return lastStats;
+    }
+
     /**
      * Iterative deepening search from the current position on `board`.
      *
@@ -77,6 +260,31 @@ public class Search {
     public int search(Board board, int maxDepth, long timeMillis, long[] gameHistoryKeys) {
         stopRequested = false;
         nodes = 0;
+        mainSearchNodes = 0;
+        quiescenceNodes = 0;
+        evaluatorCalls = 0;
+        maxSelectiveDepth = 0;
+        ttProbes = 0;
+        ttHits = 0;
+        ttExactHits = 0;
+        ttMoveAvailable = 0;
+        ttBoundCutoffs = 0;
+        mainSearchBetaCutoffs = 0;
+        quiescenceBetaCutoffs = 0;
+        firstMoveCutoffs = 0;
+        legalMovesSearched = 0;
+        lmrAttempts = 0;
+        lmrReducedSearches = 0;
+        lmrFullDepthResearches = 0;
+        seeCalls = 0;
+        mainTieBreakSeeCalls = 0;
+        qPruneSeeCalls = 0;
+        mainSeeDemotions = 0;
+        nullMoveAttempts = 0;
+        nullMoveCutoffs = 0;
+        aspirationRetries = 0;
+        repetitionExits = 0;
+        fiftyMoveExits = 0;
         tt.newSearch();
         for (int[] k : killerMoves) Arrays.fill(k, Move.NONE);
         for (int[] row : historyTable) Arrays.fill(row, 0);
@@ -112,13 +320,15 @@ public class Search {
                 beta = bestScore + window;
             }
 
-            selDepth = depth;
+            selDepth = 0;
             int score;
             while(true) {
                 score = negamax(board, depth, alpha, beta, 0, true);
                 if(score <= alpha){
+                    if (instrumentationEnabled) aspirationRetries++;
                     alpha = -INFINITY_SCORE; // fail low - widen and retry at the same depth
                 }  else if (score >= beta){
+                    if (instrumentationEnabled) aspirationRetries++;
                     beta = INFINITY_SCORE; // fail high - widen and retry at the same depth
                 }
                 else{
@@ -150,6 +360,7 @@ public class Search {
             MoveGenerator.generateLegal(board, legal);
             if (legal.size > 0) rootBestMove = legal.get(0);
         }
+        lastStats = SearchStats.capture(this);
         return rootBestMove;
     }
 
@@ -221,16 +432,24 @@ public class Search {
         if ((nodes & 2047) == 0 && checkTime()) stopRequested = true;
         if (stopRequested) return 0;
         nodes++;
+        if (instrumentationEnabled) mainSearchNodes++;
+        observeSelectiveDepth(searchPly);
 
         repetitionTainted[searchPly] = false;
 
-        if (searchPly >= MAX_PLY - 1) return Evaluator.evaluate(board);
+        if (searchPly >= MAX_PLY - 1) {
+            if (instrumentationEnabled) evaluatorCalls++;
+            return Evaluator.evaluate(board);
+        }
 
         int absPly = historyBase + searchPly;
         keyStack[absPly] = board.zobristKey;
         if (board.halfmoveClock >= 100) {
             boolean checked = board.isInCheck(board.sideToMove);
-            if (!checked || MoveGenerator.hasLegalMove(board)) return 0;
+            if (!checked || MoveGenerator.hasLegalMove(board)) {
+                if (instrumentationEnabled) fiftyMoveExits++;
+                return 0;
+            }
             return -(MATE_SCORE - searchPly);
         }
         int repetitions = 0;
@@ -238,7 +457,10 @@ public class Search {
             if (keyStack[p] == board.zobristKey) {
                 repetitions++;
                 repetitionTainted[searchPly] = true;
-                if (repetitions >= 2) return 0; // this occurrence is the genuine 3rd
+                if (repetitions >= 2) {
+                    if (instrumentationEnabled) repetitionExits++;
+                    return 0; // this occurrence is the genuine 3rd
+                }
             }
         }
         boolean repetitionSensitive = repetitions > 0;
@@ -251,9 +473,12 @@ public class Search {
 
         int origAlpha = alpha;
         int ttMove = Move.NONE;
+        if (instrumentationEnabled) ttProbes++;
         long entry = tt.probePacked(board.zobristKey);
         if (entry != 0) {
+            if (instrumentationEnabled) ttHits++;
             ttMove = TranspositionTable.moveOf(entry);
+            if (instrumentationEnabled && ttMove != Move.NONE) ttMoveAvailable++;
             // A TT score is safe only inside the search that produced it, and
             // not when this position has already occurred on the actual-game
             // history or active line. The move remains useful for ordering.
@@ -262,25 +487,30 @@ public class Search {
                 int score = adjustMateFromTT(TranspositionTable.scoreOf(entry), searchPly);
                 int flag = TranspositionTable.flagOf(entry);
                 if (flag == TranspositionTable.EXACT) {
+                    if (instrumentationEnabled) ttExactHits++;
                     if (searchPly == 0) iterationBestMove = ttMove;
                     return score;
                 }
                 if (flag == TranspositionTable.LOWER_BOUND && score > alpha) alpha = score;
                 else if (flag == TranspositionTable.UPPER_BOUND && score < beta) beta = score;
                 if (alpha >= beta) {
+                    if (instrumentationEnabled) ttBoundCutoffs++;
                     if (searchPly == 0) iterationBestMove = ttMove;
                     return score;
                 }
             }
         }
-
         if (nullOk && !inCheck && depth >= 3 && searchPly > 0 && hasNonPawnMaterial(board, board.sideToMove)) {
+            if (instrumentationEnabled) nullMoveAttempts++;
             board.makeNullMove();
             int score = -negamax(board, depth - 3, -beta, -beta + 1, searchPly + 1, false);
             board.unmakeNullMove();
             if (repetitionTainted[searchPly + 1]) repetitionTainted[searchPly] = true;
             if (stopRequested) return 0;
-            if (score >= beta) return beta;
+            if (score >= beta) {
+                if (instrumentationEnabled) nullMoveCutoffs++;
+                return beta;
+            }
         }
 
         MoveList moves = moveLists[searchPly];
@@ -297,6 +527,7 @@ public class Search {
         for (int i = 0; i < moves.size; i++) {
             int bestIdx = i;
             for (int j = i + 1; j < moves.size; j++) if (scores[j] > scores[bestIdx]) bestIdx = j;
+            bestIdx = maybeDemoteLosingCapture(board, moves, scores, bestIdx, depth, searchPly);
             if (bestIdx != i) {
                 int tmpM = moves.moves[i]; moves.moves[i] = moves.moves[bestIdx]; moves.moves[bestIdx] = tmpM;
                 int tmpS = scores[i]; scores[i] = scores[bestIdx]; scores[bestIdx] = tmpS;
@@ -309,6 +540,7 @@ public class Search {
                 continue;
             }
             legalCount++;
+            if (instrumentationEnabled) legalMovesSearched++;
 
             int score;
             boolean childRepetitionTainted;
@@ -318,9 +550,16 @@ public class Search {
             } else {
                 boolean quiet = !Move.isCapture(move) && !Move.isPromotion(move);
                 int reduction = (quiet && depth >= 3 && legalCount > 4) ? 1 : 0;
+                if (reduction > 0) {
+                    if (instrumentationEnabled) {
+                        lmrAttempts++;
+                        lmrReducedSearches++;
+                    }
+                }
                 score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, searchPly + 1, true);
                 childRepetitionTainted = repetitionTainted[searchPly + 1];
                 if (score > alpha) {
+                    if (instrumentationEnabled && reduction > 0) lmrFullDepthResearches++;
                     score = -negamax(board, depth - 1, -beta, -alpha, searchPly + 1, true);
                     childRepetitionTainted |= repetitionTainted[searchPly + 1];
                 }
@@ -338,6 +577,10 @@ public class Search {
                 alpha = score;
             }
             if (alpha >= beta) {
+                if (instrumentationEnabled) {
+                    mainSearchBetaCutoffs++;
+                    if (legalCount == 1) firstMoveCutoffs++;
+                }
                 if (!Move.isCapture(move)) {
                     historyTable[Move.from(move)][Move.to(move)] += depth * depth;
                     if (killerMoves[searchPly][0] != move) {
@@ -369,10 +612,15 @@ public class Search {
         if ((nodes & 2047) == 0 && checkTime()) stopRequested = true;
         if (stopRequested) return 0;
         nodes++;
+        if (instrumentationEnabled) quiescenceNodes++;
+        observeSelectiveDepth(searchPly);
 
         repetitionTainted[searchPly] = false;
 
-        if (searchPly >= MAX_PLY - 1) return Evaluator.evaluate(board);
+        if (searchPly >= MAX_PLY - 1) {
+            if (instrumentationEnabled) evaluatorCalls++;
+            return Evaluator.evaluate(board);
+        }
 
         if (keyStack != null) {
             int absPly = historyBase + searchPly;
@@ -382,7 +630,10 @@ public class Search {
                 if (keyStack[p] == board.zobristKey) {
                     repetitions++;
                     repetitionTainted[searchPly] = true;
-                    if (repetitions >= 2) return 0;
+                    if (repetitions >= 2) {
+                        if (instrumentationEnabled) repetitionExits++;
+                        return 0;
+                    }
                 }
             }
         }
@@ -390,8 +641,12 @@ public class Search {
         boolean inCheck = board.isInCheck(board.sideToMove);
         int standPat = -INFINITY_SCORE;
         if (!inCheck) {
+            if (instrumentationEnabled) evaluatorCalls++;
             standPat = Evaluator.evaluate(board);
-            if (standPat >= beta) return beta;
+            if (standPat >= beta) {
+                if (instrumentationEnabled) quiescenceBetaCutoffs++;
+                return beta;
+            }
             if (standPat > alpha) alpha = standPat;
         }
 
@@ -424,7 +679,12 @@ public class Search {
                 // A cheaper attacker cannot lose material on this square: the
                 // opponent can take at most that attacker before we may stop.
                 if (!prune && PIECE_VALUE[board.pieceTypeAt(Move.from(move))] > PIECE_VALUE[victim]) {
-                    prune = StaticExchange.evaluate(board, move, seeGains[searchPly]) < 0;
+                    int see = StaticExchange.evaluate(board, move, seeGains[searchPly]);
+                    if (instrumentationEnabled) {
+                        seeCalls++;
+                        qPruneSeeCalls++;
+                    }
+                    prune = see < 0;
                 }
             }
 
@@ -438,12 +698,16 @@ public class Search {
                 board.unmakeMove();
                 continue;
             }
+            if (instrumentationEnabled) legalMovesSearched++;
             int score = -quiescence(board, -beta, -alpha, searchPly + 1);
             board.unmakeMove();
             if (repetitionTainted[searchPly + 1]) repetitionTainted[searchPly] = true;
             if (stopRequested) return 0;
 
-            if (score >= beta) return beta;
+            if (score >= beta) {
+                if (instrumentationEnabled) quiescenceBetaCutoffs++;
+                return beta;
+            }
             if (score > alpha) alpha = score;
         }
         if (inCheck && legalCount == 0) return -(MATE_SCORE - searchPly);
@@ -461,30 +725,75 @@ public class Search {
         return scores;
     }
 
+    private void observeSelectiveDepth(int searchPly) {
+        int reached = searchPly + 1;
+        if (reached > selDepth) selDepth = reached;
+        if (reached > maxSelectiveDepth) maxSelectiveDepth = reached;
+    }
+
     private void scoreMoves(Board board, MoveList moves, int ttMove,
                             int searchPly, int[] scores) {
         for (int i = 0; i < moves.size; i++) {
             int move = moves.get(i);
-            if (move == ttMove) {
-                scores[i] = 2_000_000;
-            } else if (Move.isCapture(move)) {
-                scores[i] = 1_000_000 + mvvLva(board, move);
-            } else if (Move.isPromotion(move)) {
-                scores[i] = 900_000 + PIECE_VALUE[Move.promotionPieceType(move)];
-            } else if (move == killerMoves[searchPly][0]) {
-                scores[i] = 800_000;
-            } else if (move == killerMoves[searchPly][1]) {
-                scores[i] = 790_000;
-            } else {
-                scores[i] = historyTable[Move.from(move)][Move.to(move)];
-            }
+            if (move == ttMove) scores[i] = 2_000_000;
+            else if (Move.isCapture(move)) scores[i] = 1_000_000 + mvvLva(board, move);
+            else if (Move.isPromotion(move)) scores[i] = 900_000 + PIECE_VALUE[Move.promotionPieceType(move)];
+            else if (move == killerMoves[searchPly][0]) scores[i] = 800_000;
+            else if (move == killerMoves[searchPly][1]) scores[i] = 790_000;
+            else scores[i] = historyTable[Move.from(move)][Move.to(move)];
         }
     }
 
     private void scoreCaptures(Board board, MoveList moves, int[] scores) {
-        for (int i = 0; i < moves.size; i++) {
-            scores[i] = mvvLva(board, moves.get(i));
+        for (int i = 0; i < moves.size; i++) scores[i] = mvvLva(board, moves.get(i));
+    }
+
+    private int maybeDemoteLosingCapture(Board board, MoveList moves, int[] scores,
+                                         int bestIdx, int depth, int searchPly) {
+        int selected = moves.get(bestIdx);
+        if (depth < 5 || !isEligibleMainTieCapture(board, selected)) return bestIdx;
+        int rawScore = scores[bestIdx];
+        // Pay for SEE only when the legacy selection has selected a capture
+        // and a tied capture remains in the suffix.
+        boolean hasTiedCapture = false;
+        for (int j = bestIdx + 1; j < moves.size; j++) {
+            if (scores[j] == rawScore && isEligibleMainTieCapture(board, moves.get(j))) {
+                hasTiedCapture = true;
+                break;
+            }
         }
+        if (!hasTiedCapture) return bestIdx;
+
+        int selectedSee = selectiveSeeForTie(board, selected, searchPly);
+        if (selectedSee > -300) return bestIdx;
+        for (int j = bestIdx + 1; j < moves.size; j++) {
+            if (scores[j] != rawScore || !isEligibleMainTieCapture(board, moves.get(j))) continue;
+            int candidateSee = selectiveSeeForTie(board, moves.get(j), searchPly);
+            if (candidateSee >= 0) {
+                if (instrumentationEnabled) mainSeeDemotions++;
+                return j;
+            }
+        }
+        return bestIdx;
+    }
+
+    private boolean isEligibleMainTieCapture(Board board, int move) {
+        if (!Move.isCapture(move) || Move.isPromotion(move) || Move.isEnPassant(move)) return false;
+        int attacker = board.pieceTypeAt(Move.from(move));
+        int victim = board.pieceTypeAt(Move.to(move));
+        return attacker >= 0 && victim >= 0 && PIECE_VALUE[attacker] > PIECE_VALUE[victim];
+    }
+
+    private int selectiveSeeForTie(Board board, int move, int searchPly) {
+        int attacker = board.pieceTypeAt(Move.from(move));
+        int victim = Move.isEnPassant(move) ? PAWN : board.pieceTypeAt(Move.to(move));
+        if (attacker < 0 || victim < 0 || PIECE_VALUE[attacker] <= PIECE_VALUE[victim]) return 0;
+        int see = StaticExchange.evaluate(board, move, seeGains[searchPly]);
+        if (instrumentationEnabled) {
+            seeCalls++;
+            mainTieBreakSeeCalls++;
+        }
+        return see;
     }
 
     private int mvvLva(Board board, int move) {
