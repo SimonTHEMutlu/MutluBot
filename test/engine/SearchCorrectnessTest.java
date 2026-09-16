@@ -15,6 +15,7 @@ public final class SearchCorrectnessTest {
         testThirdRepetitionInGameHistoryIsDraw();
         testThirdRepetitionWithRootOmittedIsDraw();
         testTwofoldRepetitionInGameHistoryIsNotDraw();
+        testStaleTranspositionCannotForceThirdRepetition();
         testCheckmatePrecedesFiftyMoveDraw();
         testFiftyMoveDraw();
         System.out.println("SearchCorrectnessTest passed");
@@ -73,6 +74,47 @@ public final class SearchCorrectnessTest {
                         + result.nodes + " nodes");
     }
 
+    /** Regression for Round 7 of mutlubotBetavsMutlubotVariedOpenings.pgn. */
+    private static void testStaleTranspositionCannotForceThirdRepetition() {
+        String[] moves = {
+                "e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6",
+                "b1c3", "a7a6", "f2f4", "e7e6", "d1f3", "d8b6", "d4b3", "b6c7",
+                "a2a4", "b8c6", "c1e3", "e6e5", "f4f5", "f8e7", "e1c1", "e8g8",
+                "c3d5", "f6d5", "e4d5", "c6a5", "b3d2", "c8d7", "f1d3", "b7b5",
+                "a4b5", "d7b5", "c1b1", "a5c4", "d2c4", "b5c4", "d3e4", "a8b8",
+                "e3c1", "b8b5", "b2b3", "f8b8", "b1a2", "c7b6", "f3e3", "b5b3",
+                "e3b6", "b3b6", "a2a3", "b6b5", "c1d2", "c4d5", "e4d5", "b5d5",
+                "d2b4", "d5b5", "c2c3", "d6d5", "h1e1", "d5d4", "e1e4", "e7b4",
+                "c3b4", "a6a5", "g2g4", "f7f6", "h2h4", "a5b4", "a3b3", "b5c5",
+                "h4h5", "c5c3", "b3b2", "c3g3", "d1d2", "b4b3", "b2b1", "g3g1",
+                "b1b2", "g1g3", "b2b1", "g3g1", "b1b2"
+        };
+        HistoryPosition position = play(moves);
+        check(position.board.toFen().equals(
+                        "1r4k1/6pp/5p2/4pP1P/3pR1P1/1p6/1K1R4/6r1 b - - 7 43"),
+                "Round 7 regression setup produced the wrong root: " + position.board.toFen());
+
+        int drawingMove = findLegalMove(position.board, "g1g3");
+        Board repeatedChild = board(position.board.toFen());
+        repeatedChild.makeMove(findLegalMove(repeatedChild, "g1g3"));
+        int occurrences = 1; // the child being considered
+        for (long key : position.keys) if (key == repeatedChild.zobristKey) occurrences++;
+        check(occurrences >= 3, "g1g3 must create the third occurrence in the supplied history");
+
+        TranspositionTable shared = new TranspositionTable(16);
+        shared.store(position.board.zobristKey, 12, 553,
+                TranspositionTable.EXACT, drawingMove); // poison from the earlier root
+        SearchResult result = search(position.board, position.keys, shared, 12);
+        String bestMove = Move.toUci(result.move);
+        check(!bestMove.equals("g1g3"),
+                "a stale TT exact score must not force the immediate drawing move g1g3");
+        check(result.score > 0,
+                "the final root must retain a winning alternative instead of settling for repetition");
+        check(result.pv.startsWith(bestMove),
+                "reported PV must begin with the completed root move; bestmove=" + bestMove
+                        + ", pv=" + result.pv);
+    }
+
     private static void testCheckmatePrecedesFiftyMoveDraw() {
         Board board = board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1");
         SearchResult result = search(board, null);
@@ -88,15 +130,22 @@ public final class SearchCorrectnessTest {
     }
 
     private static SearchResult search(Board board, long[] history) {
+        return search(board, history, new TranspositionTable(1), 1);
+    }
+
+    private static SearchResult search(Board board, long[] history,
+                                       TranspositionTable tt, int depth) {
         SearchResult result = new SearchResult();
-        Search search = new Search(new TranspositionTable(1));
-        search.setInfoListener((depth, selDepth, score, mate, mateIn, nodes, nps, timeMs, pv) -> {
-            if (depth == 1) {
+        Search search = new Search(tt);
+        search.setInfoListener((completedDepth, selDepth, score, mate, mateIn, nodes, nps, timeMs, pv) -> {
+            if (completedDepth == result.requestedDepth) {
                 result.score = score;
                 result.nodes = nodes;
+                result.pv = pv;
             }
         });
-        search.search(board, 1, -1, history);
+        result.requestedDepth = depth;
+        result.move = search.search(board, depth, -1, history);
         return result;
     }
 
@@ -107,6 +156,17 @@ public final class SearchCorrectnessTest {
         String[] moves = {"g1f3", "g8f6", "f3g1", "f6g8"};
         for (int i = 0; i < cycles * moves.length; i++) {
             board.makeMove(findLegalMove(board, moves[i % moves.length]));
+            keys[i + 1] = board.zobristKey;
+        }
+        return new HistoryPosition(board, keys);
+    }
+
+    private static HistoryPosition play(String[] moves) {
+        Board board = new Board();
+        long[] keys = new long[moves.length + 1];
+        keys[0] = board.zobristKey;
+        for (int i = 0; i < moves.length; i++) {
+            board.makeMove(findLegalMove(board, moves[i]));
             keys[i + 1] = board.zobristKey;
         }
         return new HistoryPosition(board, keys);
@@ -169,7 +229,10 @@ public final class SearchCorrectnessTest {
     }
 
     private static final class SearchResult {
+        int requestedDepth;
+        int move;
         int score;
         long nodes;
+        String pv = "";
     }
 }

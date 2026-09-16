@@ -30,6 +30,7 @@ public class Search {
     // Each recursion level owns reusable buffers so nodes do not create garbage.
     private final MoveList[] moveLists = new MoveList[MAX_PLY];
     private final int[][] moveScores = new int[MAX_PLY][256];
+    private final boolean[] repetitionTainted = new boolean[MAX_PLY];
     private long[] keyStack;
     private int historyBase;
 
@@ -39,6 +40,7 @@ public class Search {
     private boolean timeLimited;
 
     private int rootBestMove;
+    private int iterationBestMove;
     private int selDepth;
 
     public interface InfoListener {
@@ -75,6 +77,7 @@ public class Search {
     public int search(Board board, int maxDepth, long timeMillis, long[] gameHistoryKeys) {
         stopRequested = false;
         nodes = 0;
+        tt.newSearch();
         for (int[] k : killerMoves) Arrays.fill(k, Move.NONE);
         for (int[] row : historyTable) Arrays.fill(row, 0);
 
@@ -98,6 +101,7 @@ public class Search {
         int alpha, beta;
 
         for (int depth = 1; depth <= depthLimit; depth++) {
+            iterationBestMove = Move.NONE;
             if(depth <= 2 || Math.abs(bestScore) >= MATE_SCORE - MAX_PLY - 10)
             {
                 alpha = -INFINITY_SCORE;
@@ -127,8 +131,7 @@ public class Search {
             }
 
             bestScore = score;
-            TranspositionTable.Probe p = tt.probe(board.zobristKey);
-            if (p != null && p.move != Move.NONE) rootBestMove = p.move;
+            if (iterationBestMove != Move.NONE) rootBestMove = iterationBestMove;
 
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
             if (listener != null) reportInfo(board, depth, bestScore, elapsedMs);
@@ -159,22 +162,28 @@ public class Search {
             mateIn = (pliesToMate + 1) / 2;
             if (score < 0) mateIn = -mateIn;
         }
-        String pv = extractPv(board, Math.max(depth, 1));
+        String pv = extractPv(board, Math.max(depth, 1), iterationBestMove);
         listener.onInfo(depth, selDepth, score, isMate, mateIn, nodes, nps, elapsedMs, pv);
     }
 
-    private String extractPv(Board board, int maxLen) {
+    private String extractPv(Board board, int maxLen, int reportedRootMove) {
         StringBuilder sb = new StringBuilder();
         int madeMoves = 0;
         java.util.HashSet<Long> seen = new java.util.HashSet<>();
         for (int i = 0; i < maxLen; i++) {
-            TranspositionTable.Probe p = tt.probe(board.zobristKey);
-            if (p == null || p.move == Move.NONE) break;
             if (!seen.add(board.zobristKey)) break;
-            if (!isLegalInPosition(board, p.move)) break;
-            board.makeMove(p.move);
+            int move;
+            if (i == 0 && reportedRootMove != Move.NONE) {
+                move = reportedRootMove;
+            } else {
+                TranspositionTable.Probe p = tt.probe(board.zobristKey);
+                if (p == null || p.move == Move.NONE) break;
+                move = p.move;
+            }
+            if (!isLegalInPosition(board, move)) break;
+            board.makeMove(move);
             madeMoves++;
-            sb.append(sb.length() == 0 ? "" : " ").append(Move.toUci(p.move));
+            sb.append(sb.length() == 0 ? "" : " ").append(Move.toUci(move));
         }
         for (int i = 0; i < madeMoves; i++) board.unmakeMove();
         return sb.toString();
@@ -213,6 +222,8 @@ public class Search {
         if (stopRequested) return 0;
         nodes++;
 
+        repetitionTainted[searchPly] = false;
+
         if (searchPly >= MAX_PLY - 1) return Evaluator.evaluate(board);
 
         int absPly = historyBase + searchPly;
@@ -224,11 +235,13 @@ public class Search {
         }
         int repetitions = 0;
         for (int p = absPly - 2; p >= 0; p -= 2) {
-        if (keyStack[p] == board.zobristKey) {
-        repetitions++;
-        if (repetitions >= 2) return 0; // this occurrence would be the 3rd - genuine draw
+            if (keyStack[p] == board.zobristKey) {
+                repetitions++;
+                repetitionTainted[searchPly] = true;
+                if (repetitions >= 2) return 0; // this occurrence is the genuine 3rd
             }
         }
+        boolean repetitionSensitive = repetitions > 0;
 
         boolean inCheck = board.isInCheck(board.sideToMove);
         if (depth <= 0) {
@@ -241,13 +254,23 @@ public class Search {
         long entry = tt.probePacked(board.zobristKey);
         if (entry != 0) {
             ttMove = TranspositionTable.moveOf(entry);
-            if (TranspositionTable.depthOf(entry) >= depth) {
+            // A TT score is safe only inside the search that produced it, and
+            // not when this position has already occurred on the actual-game
+            // history or active line. The move remains useful for ordering.
+            if (!repetitionSensitive && tt.isCurrentGeneration(entry)
+                    && TranspositionTable.depthOf(entry) >= depth) {
                 int score = adjustMateFromTT(TranspositionTable.scoreOf(entry), searchPly);
                 int flag = TranspositionTable.flagOf(entry);
-                if (flag == TranspositionTable.EXACT) return score;
+                if (flag == TranspositionTable.EXACT) {
+                    if (searchPly == 0) iterationBestMove = ttMove;
+                    return score;
+                }
                 if (flag == TranspositionTable.LOWER_BOUND && score > alpha) alpha = score;
                 else if (flag == TranspositionTable.UPPER_BOUND && score < beta) beta = score;
-                if (alpha >= beta) return score;
+                if (alpha >= beta) {
+                    if (searchPly == 0) iterationBestMove = ttMove;
+                    return score;
+                }
             }
         }
 
@@ -255,6 +278,7 @@ public class Search {
             board.makeNullMove();
             int score = -negamax(board, depth - 3, -beta, -beta + 1, searchPly + 1, false);
             board.unmakeNullMove();
+            if (repetitionTainted[searchPly + 1]) repetitionTainted[searchPly] = true;
             if (stopRequested) return 0;
             if (score >= beta) return beta;
         }
@@ -287,18 +311,23 @@ public class Search {
             legalCount++;
 
             int score;
+            boolean childRepetitionTainted;
             if (legalCount == 1) {
                 score = -negamax(board, depth - 1, -beta, -alpha, searchPly + 1, true);
+                childRepetitionTainted = repetitionTainted[searchPly + 1];
             } else {
                 boolean quiet = !Move.isCapture(move) && !Move.isPromotion(move);
                 int reduction = (quiet && depth >= 3 && legalCount > 4) ? 1 : 0;
                 score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, searchPly + 1, true);
+                childRepetitionTainted = repetitionTainted[searchPly + 1];
                 if (score > alpha) {
                     score = -negamax(board, depth - 1, -beta, -alpha, searchPly + 1, true);
+                    childRepetitionTainted |= repetitionTainted[searchPly + 1];
                 }
             }
 
             board.unmakeMove();
+            if (childRepetitionTainted) repetitionTainted[searchPly] = true;
             if (stopRequested) return 0;
 
             if (score > bestScore) {
@@ -328,7 +357,10 @@ public class Search {
         if (bestScore <= origAlpha) flag = TranspositionTable.UPPER_BOUND;
         else if (bestScore >= beta) flag = TranspositionTable.LOWER_BOUND;
         else flag = TranspositionTable.EXACT;
-        tt.store(board.zobristKey, depth, adjustMateToTT(bestScore, searchPly), flag, bestMove);
+        if (!repetitionTainted[searchPly]) {
+            tt.store(board.zobristKey, depth, adjustMateToTT(bestScore, searchPly), flag, bestMove);
+        }
+        if (searchPly == 0) iterationBestMove = bestMove;
 
         return bestScore;
     }
@@ -338,7 +370,22 @@ public class Search {
         if (stopRequested) return 0;
         nodes++;
 
+        repetitionTainted[searchPly] = false;
+
         if (searchPly >= MAX_PLY - 1) return Evaluator.evaluate(board);
+
+        if (keyStack != null) {
+            int absPly = historyBase + searchPly;
+            keyStack[absPly] = board.zobristKey;
+            int repetitions = 0;
+            for (int p = absPly - 2; p >= 0; p -= 2) {
+                if (keyStack[p] == board.zobristKey) {
+                    repetitions++;
+                    repetitionTainted[searchPly] = true;
+                    if (repetitions >= 2) return 0;
+                }
+            }
+        }
 
         boolean inCheck = board.isInCheck(board.sideToMove);
         int standPat = -INFINITY_SCORE;
@@ -393,6 +440,7 @@ public class Search {
             }
             int score = -quiescence(board, -beta, -alpha, searchPly + 1);
             board.unmakeMove();
+            if (repetitionTainted[searchPly + 1]) repetitionTainted[searchPly] = true;
             if (stopRequested) return 0;
 
             if (score >= beta) return beta;

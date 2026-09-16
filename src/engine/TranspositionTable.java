@@ -94,6 +94,11 @@ public class TranspositionTable {
         return (int) packed & 0xffff;
     }
 
+    /** True when this entry was written during the current top-level search. */
+    public boolean isCurrentGeneration(long packed) {
+        return packed != 0 && age(packed) == currentAge;
+    }
+
     private static int age(long packed) {
         return (int) (packed >>> AGE_SHIFT) & (int) AGE_MASK;
     }
