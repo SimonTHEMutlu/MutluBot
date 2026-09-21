@@ -1,0 +1,8 @@
+# Structural corpus for king-safety ideas collected from MutluBot games. Pending rows are legal, reproducible test positions, not assertions that the current engine has already chosen the target.
+# Run `java -cp out engine.KingSafetyRegressionCorpusTest --enforce-pending` to attempt the deliberately opt-in depth-12 move-choice check; normal validation deliberately reports them as pending.
+id	description	fen	target_moves	forbidden_moves	status	source	notes
+g7_move21	Attack the exposed kingside instead of trading the advanced pawn	r1qr2k1/ppp1bpp1/3p2b1/4pP2/2PnP1p1/1PQP3P/PB1N2B1/R3R1K1 w - - 0 21	h3g4	f5g6	pending	Game 7 move 21	Candidate king-safety regression; record a stable fixed-depth result before promoting to active.
+g7_move28	Maintain threats around the black king	r2r3k/ppp3p1/3P2p1/2P1p1b1/2Q5/1P1P4/PB1Nq1B1/R5K1 w - - 1 28	d2f3,c4e6,a1f1	d6c7	pending	Game 7 move 28	Any listed target is acceptable when this case becomes active.
+g2_move24_black	Choose the back-rank rook defense over the pawn capture	r1k4r/1p1q1pp1/pB1b1np1/3p4/2PQ2b1/1N1B4/PP3PPP/R4K1R b - - 2 24	h8e8	h8h2	pending	Game 2 move 24	Target is the h8 rook move Re8 in UCI notation.
+g8_move14_black	Develop and defend the king rather than retreating the queen	r2qkb1r/1p3pp1/p3b2p/2np4/3QpB2/4N3/PPP1BPPP/R4RK1 b kq - 3 14	f8e7,d8f6	d8d7	pending	Game 8 move 14	Either target is acceptable when this case becomes active.
+g9_move19	Advance the f-pawn to increase kingside pressure	3q1r2/pp1bppbk/3p2p1/2r3Bp/3NPP1P/1BN5/PPP1Q1P1/2KR3n w - - 2 19	f4f5	d4f3	pending	Game 9 move 19	Candidate king-safety regression; keep pending until match analysis establishes an acceptance depth.

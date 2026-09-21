@@ -18,6 +18,14 @@ public final class EvaluatorTest {
         testPerAttackerKingRingControl();
         testKingPressureCap();
         testKingPressureIsMiddlegameOnly();
+        testBlockedBishopContactsOuterZoneDefender();
+        testBlockerStopsKingZoneContact();
+        testFarDefenderAndEmptyZoneScoreZero();
+        testRookQueenAndKnightContacts();
+        testMovingOrTradingAttackerLosesBoundedBonus();
+        testKingZoneContactPerPieceCap();
+        testKingZoneContactPhaseTaper();
+        testKingZoneContactColorAndSideSymmetry();
         testActivityColorSymmetry();
         testColorAndSideToMoveSymmetry();
         System.out.println("EvaluatorTest passed");
@@ -160,6 +168,84 @@ public final class EvaluatorTest {
         check(middlegame == 0, "pure-endgame king pressure work is skipped");
         check(endgame == 0, "king pressure is fully tapered out of pure endgames");
         check(Evaluator.gamePhase(pawnPressure) == 0, "pawn pressure test is pure endgame phase");
+    }
+
+    private static void testBlockedBishopContactsOuterZoneDefender() {
+        Board board = board("6k1/8/5n2/8/8/8/1B6/K7 w - - 0 1");
+        check(Evaluator.kingZoneDefenderContactMg(board, WHITE) == 2,
+                "b2 bishop receives two MG cp for contacting Nf6 in Kg8's outer zone");
+    }
+
+    private static void testBlockerStopsKingZoneContact() {
+        Board board = board("6k1/8/5n2/8/8/2P5/1B6/K7 w - - 0 1");
+        check(Evaluator.kingZoneDefenderContactMg(board, WHITE) == 0,
+                "own c3 blocker stops the b2 bishop's contact with f6");
+    }
+
+    private static void testFarDefenderAndEmptyZoneScoreZero() {
+        Board farDefender = board("n5k1/8/8/8/8/8/1B6/K7 w - - 0 1");
+        Board emptyZone = board("6k1/8/8/8/8/8/1B6/K7 w - - 0 1");
+        check(Evaluator.kingZoneDefenderContactMg(farDefender, WHITE) == 0,
+                "enemy piece outside the extended king zone receives no contact score");
+        check(Evaluator.kingZoneDefenderContactMg(emptyZone, WHITE) == 0,
+                "empty outer-zone squares are not rewarded");
+    }
+
+    private static void testRookQueenAndKnightContacts() {
+        Board rook = board("6k1/5b2/8/8/8/8/8/K4R2 w - - 0 1");
+        Board queen = board("6k1/4r3/8/8/4Q3/8/8/K7 w - - 0 1");
+        Board knight = board("6k1/5r2/8/4N3/8/8/8/K7 w - - 0 1");
+        check(Evaluator.kingZoneDefenderContactMg(rook, WHITE) == 2,
+                "rook contact with an inner-ring defender");
+        check(Evaluator.kingZoneDefenderContactMg(queen, WHITE) == 2,
+                "queen contact with an outer-zone defender");
+        check(Evaluator.kingZoneDefenderContactMg(knight, WHITE) == 2,
+                "knight contact with an inner-ring defender");
+    }
+
+    private static void testMovingOrTradingAttackerLosesBoundedBonus() {
+        Board near = board("6k1/8/5n2/8/8/8/1B6/K7 w - - 0 1");
+        Board movedAway = board("6k1/8/5n2/8/8/8/7B/K7 w - - 0 1");
+        Board traded = board("6k1/8/5n2/8/8/8/8/K7 w - - 0 1");
+        int nearBonus = Evaluator.kingZoneDefenderContactMg(near, WHITE);
+        check(Evaluator.kingZoneDefenderContactMg(movedAway, WHITE) == 0,
+                "bishop moved away from the defender loses its retention bonus");
+        check(Evaluator.kingZoneDefenderContactMg(traded, WHITE) == 0,
+                "traded bishop has no current-position retention bonus");
+        check(nearBonus <= 25, "one traded attacker loses no more than 25 cp");
+    }
+
+    private static void testKingZoneContactPerPieceCap() {
+        Board board = board("6k1/5nnn/6Q1/8/8/8/8/K7 w - - 0 1");
+        check(Evaluator.kingZoneDefenderContactMg(board, WHITE)
+                        == Evaluator.KING_ZONE_CONTACT_CAP_MG,
+                "three defender contacts by one queen reach the four cp per-piece cap");
+    }
+
+    private static void testKingZoneContactPhaseTaper() {
+        Board board = board("6k1/8/5r2/8/8/8/1B6/K7 w - - 0 1");
+        long terms = Evaluator.activityTerms(board);
+        int middlegame = (int) (terms >> 32);
+        int endgame = (int) terms;
+        check(Evaluator.kingZoneDefenderContactMg(board, WHITE) == 2 && middlegame == 2,
+                "contact retention is stored as an exact middlegame term");
+        check(endgame == 0, "contact retention has no endgame component");
+        check(middlegame * Evaluator.gamePhase(board) / Evaluator.PHASE_MAX < middlegame,
+                "normal phase interpolation tapers contact retention");
+    }
+
+    private static void testKingZoneContactColorAndSideSymmetry() {
+        Board whiteAttack = board("6k1/8/5n2/8/8/8/1B6/K7 w - - 0 1");
+        Board blackAttack = board("k7/1b6/8/8/8/5N2/8/6K1 b - - 0 1");
+        check(Evaluator.kingZoneDefenderContactMg(whiteAttack, WHITE)
+                        == Evaluator.kingZoneDefenderContactMg(blackAttack, BLACK),
+                "defender-contact retention is color-mirror symmetric");
+        check(Evaluator.evaluate(whiteAttack) == Evaluator.evaluate(blackAttack),
+                "mirrored contact retention has the same side-to-move score");
+
+        Board samePositionBlackToMove = board("6k1/8/5n2/8/8/8/1B6/K7 b - - 0 1");
+        check(Evaluator.evaluate(whiteAttack) == -Evaluator.evaluate(samePositionBlackToMove),
+                "contact retention respects side-to-move perspective");
     }
 
     private static void testActivityColorSymmetry() {

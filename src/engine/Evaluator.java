@@ -8,7 +8,8 @@ import static engine.Bitboards.*;
 /**
  * A deliberately simple tapered evaluation function: material, piece-square
  * tables, bishop pair, passed pawns, endgame king activity, and deliberately
- * small pawn/knight activity and king-pressure terms. Good next steps:
+ * small pawn/knight activity and king-pressure terms, plus bounded contact
+ * bonuses for pieces attacking defenders near the enemy king. Good next steps:
  *   - More pawn structure (isolated/doubled pawns, pawn chains)
  *   - Broader king safety (pawn shield, open files near king, attacker counts)
  *   - Broader mobility, if it can meet the evaluator performance budget
@@ -64,6 +65,21 @@ public final class Evaluator {
     private static final int[] KING_RING_MG_WEIGHT = {1, 1, 0, 0, 0, 0};
     private static final int KING_PRESSURE_MG_CAP = 8;
     private static final int ACTIVITY_SCALE = 8;
+
+    // Position-pure retention for N/B/R/Q pieces that directly attack an enemy
+    // non-king piece inside the enemy king's extended zone. Losing this bonus
+    // after a trade is the evaluator-safe equivalent of penalizing that trade;
+    // exact last-move or near-vs-away exceptions belong in search, not a
+    // transposition-table-safe evaluation.
+    private static final int KING_ZONE_FIRST_CONTACT_MG = 2;
+    private static final int KING_ZONE_EXTRA_CONTACT_MG = 1;
+    static final int KING_ZONE_CONTACT_CAP_MG = 4;
+    private static final byte LINE_NONE = 0;
+    private static final byte LINE_DIAGONAL = 1;
+    private static final byte LINE_ORTHOGONAL = 2;
+    private static final long[][] KING_EXTENDED_ZONE = new long[2][64];
+    private static final long[][] BETWEEN = new long[64][64];
+    private static final byte[][] LINE_KIND = new byte[64][64];
 
     // Tables below are given in "a8..h8, a7..h7, ... a1..h1" reading order
     // (top of a printed board down to the bottom) and converted to our
@@ -239,6 +255,58 @@ static {
                 PASSED_PAWN_MASK[BLACK][sq] |= 1L << (targetRank * 8 + targetFile);
             }
         }
+
+        // Inner ring plus the forward half of the distance-two Chebyshev ring:
+        // toward higher ranks for White, lower for Black. For example, f6 is
+        // in the extended zone of a black king on g8.
+        int kingRank = sq >>> 3;
+        int kingFile = sq & 7;
+        for (int color = WHITE; color <= BLACK; color++) {
+            long zone = KING_ATTACKS[sq];
+            int forward = color == WHITE ? 1 : -1;
+            for (int rankStep = 1; rankStep <= 2; rankStep++) {
+                int targetRank = kingRank + forward * rankStep;
+                if (targetRank < 0 || targetRank > 7) continue;
+                for (int fileStep = -2; fileStep <= 2; fileStep++) {
+                    if (rankStep == 1 && Math.abs(fileStep) < 2) continue;
+                    int targetFile = kingFile + fileStep;
+                    if (targetFile >= 0 && targetFile < 8) {
+                        zone |= 1L << (targetRank * 8 + targetFile);
+                    }
+                }
+            }
+            KING_EXTENDED_ZONE[color][sq] = zone;
+        }
+    }
+
+    // Slider contacts become one alignment lookup plus one occupancy test.
+    // BETWEEN excludes both endpoints, so the occupied target remains attackable.
+    for (int from = 0; from < 64; from++) {
+        int fromRank = from >>> 3;
+        int fromFile = from & 7;
+        for (int to = 0; to < 64; to++) {
+            if (from == to) continue;
+            int rankDelta = (to >>> 3) - fromRank;
+            int fileDelta = (to & 7) - fromFile;
+            int step;
+            if (fileDelta == 0) {
+                LINE_KIND[from][to] = LINE_ORTHOGONAL;
+                step = rankDelta > 0 ? 8 : -8;
+            } else if (rankDelta == 0) {
+                LINE_KIND[from][to] = LINE_ORTHOGONAL;
+                step = fileDelta > 0 ? 1 : -1;
+            } else if (Math.abs(rankDelta) == Math.abs(fileDelta)) {
+                LINE_KIND[from][to] = LINE_DIAGONAL;
+                step = (rankDelta > 0 ? 8 : -8) + (fileDelta > 0 ? 1 : -1);
+            } else {
+                continue;
+            }
+            long between = 0L;
+            for (int current = from + step; current != to; current += step) {
+                between |= 1L << current;
+            }
+            BETWEEN[from][to] = between;
+        }
     }
 }
 
@@ -336,44 +404,64 @@ static {
         long blackPawnControls = pawnControlMap(b.pieceBB[BLACK][PAWN], BLACK);
         long whiteMobilityArea = ~b.occupancy[WHITE] & ~blackPawnControls;
         long blackMobilityArea = ~b.occupancy[BLACK] & ~whitePawnControls;
+        long whiteZoneDefenders = b.occupancy[WHITE]
+                & ~b.pieceBB[WHITE][KING] & KING_EXTENDED_ZONE[WHITE][whiteKingSq];
+        long blackZoneDefenders = b.occupancy[BLACK]
+                & ~b.pieceBB[BLACK][KING] & KING_EXTENDED_ZONE[BLACK][blackKingSq];
 
         int whitePressure = popcount(whitePawnControls & blackKingRing)
                 * KING_RING_MG_WEIGHT[PAWN];
         int blackPressure = popcount(blackPawnControls & whiteKingRing)
                 * KING_RING_MG_WEIGHT[PAWN];
+        int whiteRetention = 0;
+        int blackRetention = 0;
 
         for (int type = KNIGHT; type <= QUEEN; type++) {
-            if (MOBILITY_MG_WEIGHT[type] == 0 && MOBILITY_EG_WEIGHT[type] == 0
-                    && KING_RING_MG_WEIGHT[type] == 0) continue;
+            boolean baseActivity = MOBILITY_MG_WEIGHT[type] != 0
+                    || MOBILITY_EG_WEIGHT[type] != 0
+                    || KING_RING_MG_WEIGHT[type] != 0;
             long pieces = b.pieceBB[WHITE][type];
             while (pieces != 0) {
                 int sq = lsb(pieces);
                 pieces &= pieces - 1;
-                long attacks = pieceAttacks(type, sq, b.allOccupancy);
-                int mobility = popcount(attacks & whiteMobilityArea);
-                whiteMg += mobility * MOBILITY_MG_WEIGHT[type];
-                whiteEg += mobility * MOBILITY_EG_WEIGHT[type];
-                whitePressure += popcount(attacks & blackKingRing)
-                        * KING_RING_MG_WEIGHT[type];
+                if (baseActivity) {
+                    long attacks = pieceAttacks(type, sq, b.allOccupancy);
+                    int mobility = popcount(attacks & whiteMobilityArea);
+                    whiteMg += mobility * MOBILITY_MG_WEIGHT[type];
+                    whiteEg += mobility * MOBILITY_EG_WEIGHT[type];
+                    whitePressure += popcount(attacks & blackKingRing)
+                            * KING_RING_MG_WEIGHT[type];
+                }
+                if (blackZoneDefenders != 0L) {
+                    whiteRetention += kingZonePieceContactMg(
+                            type, sq, blackZoneDefenders, b.allOccupancy);
+                }
             }
 
             pieces = b.pieceBB[BLACK][type];
             while (pieces != 0) {
                 int sq = lsb(pieces);
                 pieces &= pieces - 1;
-                long attacks = pieceAttacks(type, sq, b.allOccupancy);
-                int mobility = popcount(attacks & blackMobilityArea);
-                blackMg += mobility * MOBILITY_MG_WEIGHT[type];
-                blackEg += mobility * MOBILITY_EG_WEIGHT[type];
-                blackPressure += popcount(attacks & whiteKingRing)
-                        * KING_RING_MG_WEIGHT[type];
+                if (baseActivity) {
+                    long attacks = pieceAttacks(type, sq, b.allOccupancy);
+                    int mobility = popcount(attacks & blackMobilityArea);
+                    blackMg += mobility * MOBILITY_MG_WEIGHT[type];
+                    blackEg += mobility * MOBILITY_EG_WEIGHT[type];
+                    blackPressure += popcount(attacks & whiteKingRing)
+                            * KING_RING_MG_WEIGHT[type];
+                }
+                if (whiteZoneDefenders != 0L) {
+                    blackRetention += kingZonePieceContactMg(
+                            type, sq, whiteZoneDefenders, b.allOccupancy);
+                }
             }
         }
 
         whitePressure = Math.min(whitePressure, KING_PRESSURE_MG_CAP);
         blackPressure = Math.min(blackPressure, KING_PRESSURE_MG_CAP);
 
-        int mg = (whiteMg - blackMg + whitePressure - blackPressure) / ACTIVITY_SCALE;
+        int mg = (whiteMg - blackMg + whitePressure - blackPressure) / ACTIVITY_SCALE
+                + whiteRetention - blackRetention;
         int eg = (whiteEg - blackEg) / ACTIVITY_SCALE;
         return ((long) mg << 32) | (eg & 0xffffffffL);
     }
@@ -413,6 +501,53 @@ static {
             }
         }
         return Math.min(pressure, KING_PRESSURE_MG_CAP);
+    }
+
+    /** Package-private reference calculation used by focused evaluator tests. */
+    static int kingZoneDefenderContactMg(Board b, int attackingColor) {
+        int defendingColor = opposite(attackingColor);
+        int defendingKingSq = b.kingSquare(defendingColor);
+        long defenders = b.occupancy[defendingColor]
+                & ~b.pieceBB[defendingColor][KING]
+                & KING_EXTENDED_ZONE[defendingColor][defendingKingSq];
+        if (defenders == 0L) return 0;
+
+        int bonus = 0;
+        for (int type = KNIGHT; type <= QUEEN; type++) {
+            long pieces = b.pieceBB[attackingColor][type];
+            while (pieces != 0L) {
+                int sq = lsb(pieces);
+                pieces &= pieces - 1;
+                bonus += kingZonePieceContactMg(type, sq, defenders, b.allOccupancy);
+            }
+        }
+        return bonus;
+    }
+
+    private static int kingZonePieceContactMg(
+            int type, int from, long defenders, long occupancy) {
+        int contacts = 0;
+        if (type == KNIGHT) {
+            contacts = popcount(KNIGHT_ATTACKS[from] & defenders);
+        } else {
+            long targets = defenders;
+            while (targets != 0L) {
+                int to = lsb(targets);
+                targets &= targets - 1;
+                byte line = LINE_KIND[from][to];
+                boolean aligned = type == BISHOP ? line == LINE_DIAGONAL
+                        : type == ROOK ? line == LINE_ORTHOGONAL
+                        : line != LINE_NONE;
+                if (aligned && (BETWEEN[from][to] & occupancy) == 0L) {
+                    contacts++;
+                    if (contacts == 3) break;
+                }
+            }
+        }
+        if (contacts == 0) return 0;
+        return Math.min(KING_ZONE_CONTACT_CAP_MG,
+                KING_ZONE_FIRST_CONTACT_MG
+                        + (contacts - 1) * KING_ZONE_EXTRA_CONTACT_MG);
     }
 
     private static long pieceAttacks(int type, int sq, long occupancy) {
