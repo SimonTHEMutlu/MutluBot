@@ -428,6 +428,15 @@ public class Search {
         return score;
     }
 
+    /**
+     * The root only scores a draw for a claimable third occurrence. Below the
+     * root, a second occurrence is treated as a search cycle so the engine
+     * does not prefer a reversible loop over a winning alternative.
+     */
+    private boolean isRepetitionDraw(int repetitions, int searchPly) {
+        return repetitions >= (searchPly == 0 ? 2 : 1);
+    }
+
     private int negamax(Board board, int depth, int alpha, int beta, int searchPly, boolean nullOk) {
         if ((nodes & 2047) == 0 && checkTime()) stopRequested = true;
         if (stopRequested) return 0;
@@ -457,9 +466,9 @@ public class Search {
             if (keyStack[p] == board.zobristKey) {
                 repetitions++;
                 repetitionTainted[searchPly] = true;
-                if (repetitions >= 2) {
+                if (isRepetitionDraw(repetitions, searchPly)) {
                     if (instrumentationEnabled) repetitionExits++;
-                    return 0; // this occurrence is the genuine 3rd
+                    return 0;
                 }
             }
         }
@@ -630,7 +639,7 @@ public class Search {
                 if (keyStack[p] == board.zobristKey) {
                     repetitions++;
                     repetitionTainted[searchPly] = true;
-                    if (repetitions >= 2) {
+                    if (isRepetitionDraw(repetitions, searchPly)) {
                         if (instrumentationEnabled) repetitionExits++;
                         return 0;
                     }

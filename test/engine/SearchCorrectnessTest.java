@@ -1,5 +1,6 @@
 package engine;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Arrays;
@@ -15,6 +16,8 @@ public final class SearchCorrectnessTest {
         testThirdRepetitionInGameHistoryIsDraw();
         testThirdRepetitionWithRootOmittedIsDraw();
         testTwofoldRepetitionInGameHistoryIsNotDraw();
+        testGameOneAvoidsSearchCycle();
+        testQuiescenceTwofoldSearchCycleIsDraw();
         testStaleTranspositionCannotForceThirdRepetition();
         testCheckmatePrecedesFiftyMoveDraw();
         testFiftyMoveDraw();
@@ -62,6 +65,86 @@ public final class SearchCorrectnessTest {
         HistoryPosition repeated = knightCycle(1);
         SearchResult result = search(repeated.board, repeated.keys);
         check(result.nodes > 1, "twofold repetition must not terminate as an automatic draw");
+    }
+
+    /** Regression for the winning rook ending in MutlubotBetaKingSafetyUpdateVSPhallanx24.pgn. */
+    private static void testGameOneAvoidsSearchCycle() {
+        String[] moves = {
+                "g1f3", "e7e6", "g2g3", "d7d5", "f1g2", "c7c5", "e2e3", "b8c6",
+                "d2d4", "g8f6", "e1g1", "f8e7", "b1d2", "e8g8", "c2c4", "c5d4",
+                "e3d4", "c8d7", "f1e1", "d5c4", "d2c4", "a8c8", "a2a3", "c6a5",
+                "c4e5", "f6d5", "e5d7", "d8d7", "f3e5", "d7d6", "d1a4", "a5c6",
+                "e5c6", "d6c6", "a4c6", "b7c6", "b2b4", "c8b8", "a1a2", "b8b6",
+                "c1b2", "e7f6", "e1d1", "f8b8", "d1d2", "b8a8", "g2e4", "b6b8",
+                "d2c2", "a7a5", "e4d5", "c6d5", "b2c3", "b8c8", "b4a5", "c8c4",
+                "c3d2", "c4d4", "a3a4", "d4d3", "c2c6", "h7h5", "a5a6", "g7g5",
+                "g1f1", "g5g4", "a4a5", "f6d4", "f1e2", "d3b3", "d2e3", "d4e5",
+                "a2a4", "g8g7", "a6a7", "b3b1", "c6b6", "b1g1", "f2f4", "g4f3",
+                "e2f3", "g1e1", "b6b7", "e1f1", "f3e2", "f1h1", "a4h4", "g7g6",
+                "g3g4", "h5g4", "h4g4", "g6f6", "h2h4", "h1a1", "e3d2", "a1a2",
+                "e2e1", "a2a3", "h4h5", "a3a1", "e1e2", "a1a2", "e2d1", "a2a1",
+                "d1e2", "a1a2"
+        };
+        HistoryPosition position = play(moves);
+        int priorRootMatches = 0;
+        for (int i = 0; i < position.keys.length - 1; i++) {
+            if (position.keys[i] == position.board.zobristKey) priorRootMatches++;
+        }
+        check(priorRootMatches == 1,
+                "Game 1 root after 53...Ra2 must be a twofold, got prior matches=" + priorRootMatches);
+
+        SearchResult result = search(position.board, position.keys,
+                new TranspositionTable(16), 10);
+        String bestMove = Move.toUci(result.move);
+        check(!bestMove.equals("e2d1"),
+                "Game 1 root should reject the Kd1 cycle; got " + bestMove
+                        + " at score " + result.score);
+        check(result.score > 0,
+                "Game 1 root should preserve its winning evaluation; got " + result.score);
+    }
+
+    private static void testQuiescenceTwofoldSearchCycleIsDraw() {
+        try {
+            Method method = Search.class.getDeclaredMethod(
+                    "quiescence", Board.class, int.class, int.class, int.class);
+            method.setAccessible(true);
+            Board cycleBoard = board("7k/8/8/8/8/8/8/3Q3K w - - 0 1");
+            Search cycleSearch = new Search(new TranspositionTable(1));
+            setSearchHistory(cycleSearch, 1, new long[] {cycleBoard.zobristKey, 0L, 0L});
+            int cycleScore = (Integer) method.invoke(cycleSearch, cycleBoard,
+                    -Evaluator.INFINITY_SCORE, Evaluator.INFINITY_SCORE, 1);
+            check(cycleScore == 0,
+                    "qsearch must score a twofold search cycle as a draw; got " + cycleScore);
+
+            Board winningBoard = board("7k/8/8/8/8/8/8/3Q3K w - - 0 1");
+            Search rootTwofoldSearch = new Search(new TranspositionTable(1));
+            setSearchHistory(rootTwofoldSearch, 2,
+                    new long[] {winningBoard.zobristKey, 0L, 0L});
+            int rootTwofoldScore = (Integer) method.invoke(rootTwofoldSearch, winningBoard,
+                    -Evaluator.INFINITY_SCORE, Evaluator.INFINITY_SCORE, 0);
+            check(rootTwofoldScore > 0,
+                    "root qsearch must not treat a twofold as terminal; got " + rootTwofoldScore);
+
+            Search rootThirdfoldSearch = new Search(new TranspositionTable(1));
+            setSearchHistory(rootThirdfoldSearch, 4,
+                    new long[] {winningBoard.zobristKey, 0L, winningBoard.zobristKey, 0L, 0L});
+            int rootThirdfoldScore = (Integer) method.invoke(rootThirdfoldSearch, winningBoard,
+                    -Evaluator.INFINITY_SCORE, Evaluator.INFINITY_SCORE, 0);
+            check(rootThirdfoldScore == 0,
+                    "root qsearch must recognize a genuine third occurrence; got " + rootThirdfoldScore);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("could not exercise qsearch repetition handling", e);
+        }
+    }
+
+    private static void setSearchHistory(Search search, int base, long[] keys)
+            throws ReflectiveOperationException {
+        Field historyBase = Search.class.getDeclaredField("historyBase");
+        Field keyStack = Search.class.getDeclaredField("keyStack");
+        historyBase.setAccessible(true);
+        keyStack.setAccessible(true);
+        historyBase.setInt(search, base);
+        keyStack.set(search, Arrays.copyOf(keys, base + Search.MAX_PLY + 8));
     }
 
     private static void testThirdRepetitionWithRootOmittedIsDraw() {
