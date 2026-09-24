@@ -11,6 +11,8 @@ public final class SearchCorrectnessTest {
 
     public static void main(String[] args) {
         testQuiescenceRecognizesCheckmate();
+        testQuiescenceRecognizesStalemate();
+        testLegalKingMovePrefilter();
         testQuiescenceSearchesQuietCheckEvasions();
         testQuiescenceSearchesQuietPromotions();
         testThirdRepetitionInGameHistoryIsDraw();
@@ -32,6 +34,39 @@ public final class SearchCorrectnessTest {
         check(score == -(Evaluator.MATE_SCORE - ply),
                 "quiescence must return mate score when the checked side has no evasion; got " + score);
         check(before.equals(board.toFen()), "checkmate quiescence must restore the board");
+    }
+
+    private static void testQuiescenceRecognizesStalemate() {
+        Board board = board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1");
+        String before = board.toFen();
+        check(!MoveGenerator.hasLegalKingMove(board),
+                "stalemated king must have no legal adjacent move");
+        check(!MoveGenerator.hasLegalMove(board), "stalemate setup must have no legal move");
+        int score = quiescence(board, 0);
+        check(score == 0, "quiescence must score stalemate as a draw; got " + score);
+        check(before.equals(board.toFen()), "stalemate quiescence must restore the board");
+    }
+
+    private static void testLegalKingMovePrefilter() {
+        Board board = new Board();
+        String before = board.toFen();
+        check(!MoveGenerator.hasLegalKingMove(board),
+                "blocked starting king must have no legal adjacent move");
+        check(MoveGenerator.hasLegalPawnMove(board, new MoveList()),
+                "starting position must have a legal pawn move");
+        check(before.equals(board.toFen()), "king move prefilter must restore the board");
+
+        board.setFromFen("7k/8/8/8/8/8/8/K7 w - - 0 1");
+        before = board.toFen();
+        check(MoveGenerator.hasLegalKingMove(board),
+                "open king must have at least one legal adjacent move");
+        check(before.equals(board.toFen()), "successful king prefilter must restore the board");
+
+        board.setFromFen("k7/8/8/8/8/8/K1P4r/8 w - - 0 1");
+        before = board.toFen();
+        check(!MoveGenerator.hasLegalPawnMove(board, new MoveList()),
+                "pinned pawn moves that expose the king must not pass the prefilter");
+        check(before.equals(board.toFen()), "pinned pawn prefilter must restore the board");
     }
 
     private static void testQuiescenceSearchesQuietCheckEvasions() {

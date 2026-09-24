@@ -197,4 +197,42 @@ public class MoveGenerator {
         }
         return false;
     }
+
+    /**
+     * Fast, allocation-free check for a legal adjacent king move. This is a
+     * one-way existence prefilter: false does not rule out castling or moves
+     * by another piece, so callers may still need {@link #hasLegalMove(Board)}.
+     */
+    public static boolean hasLegalKingMove(Board b) {
+        int us = b.sideToMove;
+        int them = Piece.opposite(us);
+        int from = b.kingSquare(us);
+        long targets = KING_ATTACKS[from] & ~b.occupancy[us];
+        long enemy = b.occupancy[them];
+        while (targets != 0L) {
+            int to = lsb(targets);
+            targets &= targets - 1;
+            int flag = (enemy & (1L << to)) != 0L ? Move.CAPTURE : Move.QUIET;
+            b.makeMove(Move.encode(from, to, flag));
+            boolean legal = !b.isInCheck(us);
+            b.unmakeMove();
+            if (legal) return true;
+        }
+        return false;
+    }
+
+    /** Fast, allocation-free check for a legal pawn move using caller-owned scratch storage. */
+    public static boolean hasLegalPawnMove(Board b, MoveList scratch) {
+        scratch.clear();
+        int us = b.sideToMove;
+        generatePawnMoves(b, scratch, us, Piece.opposite(us), false);
+        for (int i = 0; i < scratch.size; i++) {
+            int move = scratch.get(i);
+            b.makeMove(move);
+            boolean legal = !b.isInCheck(us);
+            b.unmakeMove();
+            if (legal) return true;
+        }
+        return false;
+    }
 }

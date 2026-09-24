@@ -650,6 +650,12 @@ public class Search {
         boolean inCheck = board.isInCheck(board.sideToMove);
         int standPat = -INFINITY_SCORE;
         if (!inCheck) {
+            // Quiescence can be entered immediately after a move that leaves
+            // the opponent with no legal moves. Without this terminal check,
+            // a stalemate at the horizon is incorrectly scored by stand-pat.
+            if (!MoveGenerator.hasLegalKingMove(board)
+                    && !MoveGenerator.hasLegalPawnMove(board, moveLists[searchPly])
+                    && !MoveGenerator.hasLegalMove(board)) return 0;
             if (instrumentationEnabled) evaluatorCalls++;
             standPat = Evaluator.evaluate(board);
             if (standPat >= beta) {
