@@ -7,9 +7,8 @@ import static engine.Bitboards.*;
 
 /**
  * A deliberately simple tapered evaluation function: material, piece-square
- * tables, bishop pair, passed pawns, endgame king activity, and deliberately
- * small pawn/knight activity and king-pressure terms, plus bounded contact
- * bonuses for pieces attacking defenders near the enemy king. Good next steps:
+ * tables, bishop pair, passed pawns, endgame king activity, and a bounded
+ * middlegame king-danger term. Good next steps:
  *   - More pawn structure (isolated/doubled pawns, pawn chains)
  *   - Broader king safety (pawn shield, open files near king, attacker counts)
  *   - Broader mobility, if it can meet the evaluator performance budget
@@ -48,38 +47,35 @@ public final class Evaluator {
     static final int ENEMY_PAWN_KING_PROXIMITY = 2;
     private static final long[][] PASSED_PAWN_MASK = new long[2][64];
 
-    // Modest, allocation-free activity terms. Pawns and kings deliberately
-    // receive no mobility score: pawn pushes require move-generation logic and
-    // pseudo-legal king mobility would reward moves into attacked squares.
-    // The full N/B/R/Q candidate missed the performance and node-stability
-    // gates. Keep only the cheap knight signal in production; the generic
-    // attack helpers remain available to focused tests.
-    private static final int[] MOBILITY_MG_WEIGHT = {0, 1, 0, 0, 0, 0};
-    private static final int[] MOBILITY_EG_WEIGHT = {0, 0, 0, 0, 0, 0};
-    // Middlegame points per king-ring square controlled by each attacker. Direct
-    // pressure is symmetric: attacks near our king are subtracted when the
-    // opponent's pressure is removed from our own pressure.
-    // Likewise, retain only pawn and knight pressure. Scaling the symmetric net
-    // term keeps the feature below the search-instability threshold observed in
-    // the broader experiments while still allowing real non-zero contributions.
-    private static final int[] KING_RING_MG_WEIGHT = {1, 1, 0, 0, 0, 0};
-    private static final int KING_PRESSURE_MG_CAP = 8;
-    private static final int ACTIVITY_SCALE = 8;
+    // Mobility is deliberately disabled in this isolated king-safety pass. The
+    // attack maps below are used only for king danger, avoiding a second set of
+    // slider walks and keeping this experiment measurable.
+    // Piece indices are P=0, N=1, B=2, R=3, Q=4, K=5. Pawns are counted
+    // separately below because their attack map is color-dependent.
+    static final int[] KING_ATTACK_UNIT = {0, 2, 2, 3, 5, 0};
+    private static final int[] KING_DANGER_TABLE = {
+            0, 0, 2, 4, 7, 11, 16, 22,
+            29, 37, 46, 56, 68, 82, 98, 116
+    };
+    static final int KING_DANGER_MG_CAP = 140;
+    private static final int KING_ATTACKED_SQUARE_SCALE = 1;
+    private static final int KING_ATTACKER_SCALE = 6;
+    private static final int KING_NO_QUEEN_NUMERATOR = 3;
+    private static final int KING_NO_QUEEN_DENOMINATOR = 4;
+    private static final int KING_OPEN_FILE_MG = 5;
+    private static final int KING_SEMIOPEN_FILE_MG = 2;
+    private static final long[] KING_INNER_ZONE = new long[64];
+    private static final long[] KING_OUTER_ZONE = new long[64];
 
-    // Position-pure retention for N/B/R/Q pieces that directly attack an enemy
-    // non-king piece inside the enemy king's extended zone. Losing this bonus
-    // after a trade is the evaluator-safe equivalent of penalizing that trade;
-    // exact last-move or near-vs-away exceptions belong in search, not a
-    // transposition-table-safe evaluation.
-    private static final int KING_ZONE_FIRST_CONTACT_MG = 2;
-    private static final int KING_ZONE_EXTRA_CONTACT_MG = 1;
-    static final int KING_ZONE_CONTACT_CAP_MG = 4;
-    private static final byte LINE_NONE = 0;
-    private static final byte LINE_DIAGONAL = 1;
-    private static final byte LINE_ORTHOGONAL = 2;
-    private static final long[][] KING_EXTENDED_ZONE = new long[2][64];
-    private static final long[][] BETWEEN = new long[64][64];
-    private static final byte[][] LINE_KIND = new byte[64][64];
+    // Middlegame-only pawn shelter. One pawn advanced a single rank beyond
+    // immediate cover is free; additional looseness is nonlinear, and a
+    // missing pawn is worse than a far-advanced pawn. Normal phase blending
+    // fades the white-relative term completely out of pawn-only endings.
+    private static final int SHELTER_EXTRA_LOOSE_MG = 4;
+    private static final int SHELTER_FAR_PAWN_MG = 10;
+    private static final int SHELTER_MISSING_PAWN_MG = 14;
+    private static final int SHELTER_MULTIPLE_WEAK_MG = 4;
+    static final int KING_SHELTER_MG_CAP = 40;
 
     // Tables below are given in "a8..h8, a7..h7, ... a1..h1" reading order
     // (top of a printed board down to the bottom) and converted to our
@@ -256,57 +252,21 @@ static {
             }
         }
 
-        // Inner ring plus the forward half of the distance-two Chebyshev ring:
-        // toward higher ranks for White, lower for Black. For example, f6 is
-        // in the extended zone of a black king on g8.
+        // The king zone is the adjacent ring plus the complete distance-two
+        // Chebyshev ring. It is deliberately color-independent and therefore
+        // mirror-symmetric.
         int kingRank = sq >>> 3;
         int kingFile = sq & 7;
-        for (int color = WHITE; color <= BLACK; color++) {
-            long zone = KING_ATTACKS[sq];
-            int forward = color == WHITE ? 1 : -1;
-            for (int rankStep = 1; rankStep <= 2; rankStep++) {
-                int targetRank = kingRank + forward * rankStep;
-                if (targetRank < 0 || targetRank > 7) continue;
-                for (int fileStep = -2; fileStep <= 2; fileStep++) {
-                    if (rankStep == 1 && Math.abs(fileStep) < 2) continue;
-                    int targetFile = kingFile + fileStep;
-                    if (targetFile >= 0 && targetFile < 8) {
-                        zone |= 1L << (targetRank * 8 + targetFile);
-                    }
+        KING_INNER_ZONE[sq] = KING_ATTACKS[sq];
+        long outerZone = 0L;
+        for (int zoneRank = Math.max(0, kingRank - 2); zoneRank <= Math.min(7, kingRank + 2); zoneRank++) {
+            for (int zoneFile = Math.max(0, kingFile - 2); zoneFile <= Math.min(7, kingFile + 2); zoneFile++) {
+                if (Math.max(Math.abs(zoneRank - kingRank), Math.abs(zoneFile - kingFile)) == 2) {
+                    outerZone |= 1L << (zoneRank * 8 + zoneFile);
                 }
             }
-            KING_EXTENDED_ZONE[color][sq] = zone;
         }
-    }
-
-    // Slider contacts become one alignment lookup plus one occupancy test.
-    // BETWEEN excludes both endpoints, so the occupied target remains attackable.
-    for (int from = 0; from < 64; from++) {
-        int fromRank = from >>> 3;
-        int fromFile = from & 7;
-        for (int to = 0; to < 64; to++) {
-            if (from == to) continue;
-            int rankDelta = (to >>> 3) - fromRank;
-            int fileDelta = (to & 7) - fromFile;
-            int step;
-            if (fileDelta == 0) {
-                LINE_KIND[from][to] = LINE_ORTHOGONAL;
-                step = rankDelta > 0 ? 8 : -8;
-            } else if (rankDelta == 0) {
-                LINE_KIND[from][to] = LINE_ORTHOGONAL;
-                step = fileDelta > 0 ? 1 : -1;
-            } else if (Math.abs(rankDelta) == Math.abs(fileDelta)) {
-                LINE_KIND[from][to] = LINE_DIAGONAL;
-                step = (rankDelta > 0 ? 8 : -8) + (fileDelta > 0 ? 1 : -1);
-            } else {
-                continue;
-            }
-            long between = 0L;
-            for (int current = from + step; current != to; current += step) {
-                between |= 1L << current;
-            }
-            BETWEEN[from][to] = between;
-        }
+        KING_OUTER_ZONE[sq] = outerZone;
     }
 }
 
@@ -360,6 +320,9 @@ static {
     if (popcount(b.pieceBB[BLACK][BISHOP]) >= 2) { mgScore -= 30; egScore -= 30; }
 
     int phase = gamePhase(b);
+    if (phase != 0) {
+        mgScore += kingShelterPenaltyMg(b, BLACK) - kingShelterPenaltyMg(b, WHITE);
+    }
     long activity = activityTerms(b, phase);
     mgScore += (int) (activity >> 32);
     egScore += (int) activity;
@@ -378,176 +341,171 @@ static {
         return (PASSED_PAWN_MASK[color][sq] & enemyPawns) == 0;
     }
 
-    /**
-     * Returns the white-relative activity terms packed as MG in the high int
-     * and EG in the low int. This is package-private for focused evaluator
-     * tests; the search hot path unpacks it without allocating an object.
-     */
+    /** Returns white-relative, middlegame-only king danger packed as MG/EG. */
     static long activityTerms(Board b) {
         return activityTerms(b, gamePhase(b));
     }
 
     private static long activityTerms(Board b, int phase) {
-        // With no non-pawn material there is no N/B/R/Q mobility, and the
-        // middlegame-only king-pressure term would be fully tapered out.
         if (phase == 0) return 0L;
-
-        int whiteMg = 0, blackMg = 0;
-        int whiteEg = 0, blackEg = 0;
-
-        int whiteKingSq = b.kingSquare(WHITE);
-        int blackKingSq = b.kingSquare(BLACK);
-        long whiteKingRing = KING_ATTACKS[whiteKingSq];
-        long blackKingRing = KING_ATTACKS[blackKingSq];
-
-        long whitePawnControls = pawnControlMap(b.pieceBB[WHITE][PAWN], WHITE);
-        long blackPawnControls = pawnControlMap(b.pieceBB[BLACK][PAWN], BLACK);
-        long whiteMobilityArea = ~b.occupancy[WHITE] & ~blackPawnControls;
-        long blackMobilityArea = ~b.occupancy[BLACK] & ~whitePawnControls;
-        long whiteZoneDefenders = b.occupancy[WHITE]
-                & ~b.pieceBB[WHITE][KING] & KING_EXTENDED_ZONE[WHITE][whiteKingSq];
-        long blackZoneDefenders = b.occupancy[BLACK]
-                & ~b.pieceBB[BLACK][KING] & KING_EXTENDED_ZONE[BLACK][blackKingSq];
-
-        int whitePressure = popcount(whitePawnControls & blackKingRing)
-                * KING_RING_MG_WEIGHT[PAWN];
-        int blackPressure = popcount(blackPawnControls & whiteKingRing)
-                * KING_RING_MG_WEIGHT[PAWN];
-        int whiteRetention = 0;
-        int blackRetention = 0;
-
-        for (int type = KNIGHT; type <= QUEEN; type++) {
-            boolean baseActivity = MOBILITY_MG_WEIGHT[type] != 0
-                    || MOBILITY_EG_WEIGHT[type] != 0
-                    || KING_RING_MG_WEIGHT[type] != 0;
-            long pieces = b.pieceBB[WHITE][type];
-            while (pieces != 0) {
-                int sq = lsb(pieces);
-                pieces &= pieces - 1;
-                if (baseActivity) {
-                    long attacks = pieceAttacks(type, sq, b.allOccupancy);
-                    int mobility = popcount(attacks & whiteMobilityArea);
-                    whiteMg += mobility * MOBILITY_MG_WEIGHT[type];
-                    whiteEg += mobility * MOBILITY_EG_WEIGHT[type];
-                    whitePressure += popcount(attacks & blackKingRing)
-                            * KING_RING_MG_WEIGHT[type];
-                }
-                if (blackZoneDefenders != 0L) {
-                    whiteRetention += kingZonePieceContactMg(
-                            type, sq, blackZoneDefenders, b.allOccupancy);
-                }
-            }
-
-            pieces = b.pieceBB[BLACK][type];
-            while (pieces != 0) {
-                int sq = lsb(pieces);
-                pieces &= pieces - 1;
-                if (baseActivity) {
-                    long attacks = pieceAttacks(type, sq, b.allOccupancy);
-                    int mobility = popcount(attacks & blackMobilityArea);
-                    blackMg += mobility * MOBILITY_MG_WEIGHT[type];
-                    blackEg += mobility * MOBILITY_EG_WEIGHT[type];
-                    blackPressure += popcount(attacks & whiteKingRing)
-                            * KING_RING_MG_WEIGHT[type];
-                }
-                if (whiteZoneDefenders != 0L) {
-                    blackRetention += kingZonePieceContactMg(
-                            type, sq, whiteZoneDefenders, b.allOccupancy);
-                }
-            }
-        }
-
-        whitePressure = Math.min(whitePressure, KING_PRESSURE_MG_CAP);
-        blackPressure = Math.min(blackPressure, KING_PRESSURE_MG_CAP);
-
-        int mg = (whiteMg - blackMg + whitePressure - blackPressure) / ACTIVITY_SCALE
-                + whiteRetention - blackRetention;
-        int eg = (whiteEg - blackEg) / ACTIVITY_SCALE;
-        return ((long) mg << 32) | (eg & 0xffffffffL);
-    }
-
-    /** Total safe pseudo-mobility for one non-pawn, non-king piece type. */
-    static int safeMobilityCount(Board b, int color, int type) {
-        if (type < KNIGHT || type > QUEEN) return 0;
-        long enemyPawnControls = pawnControlMap(b.pieceBB[opposite(color)][PAWN], opposite(color));
-        long mobilityArea = ~b.occupancy[color] & ~enemyPawnControls;
-        int count = 0;
-        long pieces = b.pieceBB[color][type];
-        while (pieces != 0) {
-            int sq = lsb(pieces);
-            pieces &= pieces - 1;
-            long attacks = pieceAttacks(type, sq, b.allOccupancy);
-            count += popcount(attacks & mobilityArea);
-        }
-        return count;
-    }
-
-    /** Package-private reference calculation used only by focused tests. */
-    static int kingPressureMg(Board b, int attackingColor) {
-        int defendingColor = opposite(attackingColor);
-        int defendingKingSq = b.kingSquare(defendingColor);
-        long attackingPawnControls = pawnControlMap(b.pieceBB[attackingColor][PAWN], attackingColor);
-        long defendingKingRing = KING_ATTACKS[defendingKingSq];
-        int pressure = popcount(attackingPawnControls & defendingKingRing)
-                * KING_RING_MG_WEIGHT[PAWN];
-
-        for (int type = KNIGHT; type <= QUEEN; type++) {
-            long pieces = b.pieceBB[attackingColor][type];
-            while (pieces != 0) {
-                int sq = lsb(pieces);
-                pieces &= pieces - 1;
-                pressure += popcount(pieceAttacks(type, sq, b.allOccupancy) & defendingKingRing)
-                        * KING_RING_MG_WEIGHT[type];
-            }
-        }
-        return Math.min(pressure, KING_PRESSURE_MG_CAP);
+        int mg = kingDangerMg(b, WHITE) - kingDangerMg(b, BLACK);
+        return ((long) mg << 32);
     }
 
     /** Package-private reference calculation used by focused evaluator tests. */
-    static int kingZoneDefenderContactMg(Board b, int attackingColor) {
-        int defendingColor = opposite(attackingColor);
-        int defendingKingSq = b.kingSquare(defendingColor);
-        long defenders = b.occupancy[defendingColor]
-                & ~b.pieceBB[defendingColor][KING]
-                & KING_EXTENDED_ZONE[defendingColor][defendingKingSq];
-        if (defenders == 0L) return 0;
+    static int kingPressureMg(Board b, int attackingColor) {
+        return kingDangerMg(b, attackingColor);
+    }
 
-        int bonus = 0;
+    private static int kingDangerMg(Board b, int attackingColor) {
+        int defendingColor = opposite(attackingColor);
+        long innerZone = KING_INNER_ZONE[b.kingSquare(defendingColor)];
+        long outerZone = KING_OUTER_ZONE[b.kingSquare(defendingColor)];
+        long defendingOccupancy = b.occupancy[defendingColor];
+        long attackedZone = 0L;
+        int attackUnits = 0;
+        int attackers = 0;
+        int outerOnlyUnits = 0;
+        int outerOnlyAttackers = 0;
+        long outerOnlyZone = 0L;
+        int occupiedOuterUnits = 0;
+        int occupiedOuterAttackers = 0;
+        long occupiedOuterZone = 0L;
+
+        long pawns = b.pieceBB[attackingColor][PAWN];
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            long attacks = PAWN_ATTACKS[attackingColor][sq];
+            long innerHit = attacks & innerZone;
+            long outerHit = attacks & outerZone;
+            if (innerHit != 0L) {
+                attackUnits++;
+                attackers++;
+                attackedZone |= innerHit;
+            } else if (outerHit != 0L) {
+                outerOnlyUnits++;
+                outerOnlyAttackers++;
+                outerOnlyZone |= outerHit;
+                long occupiedHit = outerHit & defendingOccupancy;
+                if (occupiedHit != 0L) {
+                    occupiedOuterUnits++;
+                    occupiedOuterAttackers++;
+                    occupiedOuterZone |= occupiedHit;
+                }
+            }
+        }
+
         for (int type = KNIGHT; type <= QUEEN; type++) {
             long pieces = b.pieceBB[attackingColor][type];
             while (pieces != 0L) {
                 int sq = lsb(pieces);
                 pieces &= pieces - 1;
-                bonus += kingZonePieceContactMg(type, sq, defenders, b.allOccupancy);
-            }
-        }
-        return bonus;
-    }
-
-    private static int kingZonePieceContactMg(
-            int type, int from, long defenders, long occupancy) {
-        int contacts = 0;
-        if (type == KNIGHT) {
-            contacts = popcount(KNIGHT_ATTACKS[from] & defenders);
-        } else {
-            long targets = defenders;
-            while (targets != 0L) {
-                int to = lsb(targets);
-                targets &= targets - 1;
-                byte line = LINE_KIND[from][to];
-                boolean aligned = type == BISHOP ? line == LINE_DIAGONAL
-                        : type == ROOK ? line == LINE_ORTHOGONAL
-                        : line != LINE_NONE;
-                if (aligned && (BETWEEN[from][to] & occupancy) == 0L) {
-                    contacts++;
-                    if (contacts == 3) break;
+                long attacks = pieceAttacks(type, sq, b.allOccupancy);
+                long innerHit = attacks & innerZone;
+                long outerHit = attacks & outerZone;
+                if (innerHit != 0L) {
+                    attackUnits += KING_ATTACK_UNIT[type];
+                    attackers++;
+                    attackedZone |= innerHit;
+                } else if (outerHit != 0L) {
+                    outerOnlyUnits += KING_ATTACK_UNIT[type];
+                    outerOnlyAttackers++;
+                    outerOnlyZone |= outerHit;
+                    long occupiedHit = outerHit & defendingOccupancy;
+                    if (occupiedHit != 0L) {
+                        occupiedOuterUnits += KING_ATTACK_UNIT[type];
+                        occupiedOuterAttackers++;
+                        occupiedOuterZone |= occupiedHit;
+                    }
                 }
             }
         }
-        if (contacts == 0) return 0;
-        return Math.min(KING_ZONE_CONTACT_CAP_MG,
-                KING_ZONE_FIRST_CONTACT_MG
-                        + (contacts - 1) * KING_ZONE_EXTRA_CONTACT_MG);
+
+        // A lone ray into an empty distance-two square is not king pressure.
+        // Occupied outer-zone contact is meaningful on its own; otherwise the
+        // outer ring requires at least two distinct attacking pieces.
+        if (outerOnlyAttackers >= 2) {
+            attackUnits += outerOnlyUnits;
+            attackers += outerOnlyAttackers;
+            attackedZone |= outerOnlyZone;
+        } else if (occupiedOuterAttackers != 0) {
+            attackUnits += occupiedOuterUnits;
+            attackers += occupiedOuterAttackers;
+            attackedZone |= occupiedOuterZone;
+        }
+
+        int danger = KING_DANGER_TABLE[Math.min(attackUnits, KING_DANGER_TABLE.length - 1)];
+        danger += Math.min(18, Math.max(0, attackers - 1) * KING_ATTACKER_SCALE);
+        danger += Math.min(12, popcount(attackedZone) * KING_ATTACKED_SQUARE_SCALE);
+        if (b.pieceBB[attackingColor][QUEEN] == 0L) {
+            danger = danger * KING_NO_QUEEN_NUMERATOR / KING_NO_QUEEN_DENOMINATOR;
+        }
+        danger += openFileDangerMg(b, attackingColor, defendingColor);
+        return Math.min(danger, KING_DANGER_MG_CAP);
+    }
+
+    /** Positive MG penalty against {@code color}; package-private for tests. */
+    static int kingShelterPenaltyMg(Board b, int color) {
+        int kingSq = b.kingSquare(color);
+        int kingRank = kingSq >>> 3;
+        int kingFile = kingSq & 7;
+        // The shelter model is for castled/wing kings. Central d/e-file kings
+        // are handled by development and open-center terms, not wing shelter.
+        if (kingFile >= 3 && kingFile <= 4) return 0;
+        int firstFile = Math.max(0, Math.min(5, kingFile - 1));
+        int forward = color == WHITE ? 1 : -1;
+        long pawns = b.pieceBB[color][PAWN];
+
+        int looseFiles = 0;
+        int farFiles = 0;
+        int missingFiles = 0;
+        int weakFiles = 0;
+
+        for (int file = firstFile; file < firstFile + 3; file++) {
+            int distance = 0;
+            for (int rank = kingRank + forward, step = 1;
+                    rank >= 0 && rank < 8; rank += forward, step++) {
+                if ((pawns & (1L << (rank * 8 + file))) != 0L) {
+                    distance = step;
+                    break;
+                }
+            }
+
+            if (distance == 1) continue;
+            weakFiles++;
+            if (distance == 2) looseFiles++;
+            else if (distance >= 3) farFiles++;
+            else missingFiles++;
+        }
+
+        int penalty = Math.max(0, looseFiles - 1) * SHELTER_EXTRA_LOOSE_MG
+                + farFiles * SHELTER_FAR_PAWN_MG
+                + missingFiles * SHELTER_MISSING_PAWN_MG;
+        if (weakFiles >= 2) penalty += SHELTER_MULTIPLE_WEAK_MG;
+        return Math.min(penalty, KING_SHELTER_MG_CAP);
+    }
+
+    static int openFileDangerMg(Board b, int attackingColor, int defendingColor) {
+        // Pawnless files are only a king-safety concern when the attacker has
+        // a rook or queen available to use them. Without a heavy piece, this
+        // feature otherwise punishes open files even in harmless endings.
+        if ((b.pieceBB[attackingColor][ROOK] | b.pieceBB[attackingColor][QUEEN]) == 0L) return 0;
+        int kingFile = b.kingSquare(defendingColor) & 7;
+        long attackingPawns = b.pieceBB[attackingColor][PAWN];
+        long defendingPawns = b.pieceBB[defendingColor][PAWN];
+        int danger = 0;
+        for (int file = Math.max(0, kingFile - 1); file <= Math.min(7, kingFile + 1); file++) {
+            long fileMask = FILE_MASK[file];
+            // From the attacker's perspective, its own pawn closes the file
+            // to its rook/queen. Otherwise the file is open if the defender
+            // also has no pawn, or semi-open if a defending pawn can be
+            // targeted on that file.
+            if ((attackingPawns & fileMask) != 0L) continue;
+            danger += (defendingPawns & fileMask) == 0L
+                    ? KING_OPEN_FILE_MG : KING_SEMIOPEN_FILE_MG;
+        }
+        return Math.min(16, danger);
     }
 
     private static long pieceAttacks(int type, int sq, long occupancy) {
