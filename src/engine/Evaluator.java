@@ -358,6 +358,11 @@ static {
     }
 
     private static int kingDangerMg(Board b, int attackingColor) {
+        // Require five cleared back-rank slots before charging for king
+        // attacks. Moved and exchanged/captured N/B/R/Q/K pieces both clear a
+        // slot; pawns never do. This keeps the gate stable after trades.
+        if (developedOrExchangedNonPawnSlots(b, attackingColor) < 5) return 0;
+
         int defendingColor = opposite(attackingColor);
         long innerZone = KING_INNER_ZONE[b.kingSquare(defendingColor)];
         long outerZone = KING_OUTER_ZONE[b.kingSquare(defendingColor)];
@@ -443,6 +448,15 @@ static {
         }
         danger += openFileDangerMg(b, attackingColor, defendingColor);
         return Math.min(danger, KING_DANGER_MG_CAP);
+    }
+
+    private static int developedOrExchangedNonPawnSlots(Board b, int color) {
+        long homeRank = color == WHITE ? RANK_1 : RANK_8;
+        int survivingHomePieces = 0;
+        for (int type = KNIGHT; type <= KING; type++) {
+            survivingHomePieces += popcount(b.pieceBB[color][type] & homeRank);
+        }
+        return Math.max(0, Math.min(8, 8 - survivingHomePieces));
     }
 
     /** Positive MG penalty against {@code color}; package-private for tests. */

@@ -13,6 +13,7 @@ public final class EvaluatorTest {
         testOwnPassedPawnProximity();
         testEnemyPawnProximityAndPhaseTaper();
         testKingAttackUnitMapping();
+        testKingDangerDevelopmentGate();
         testSinglePieceKingPressure();
         testNonlinearKingPressure();
         testCentralQueenOuterRayIsIgnored();
@@ -90,13 +91,9 @@ public final class EvaluatorTest {
     }
 
     private static void testSinglePieceKingPressure() {
-        Board bishop = board("6k1/8/8/8/8/8/1B6/K7 w - - 0 1");
-        Board rook = board("6k1/8/8/8/8/8/8/K4R2 w - - 0 1");
-        Board queen = board("6k1/8/8/8/4Q3/8/8/K7 w - - 0 1");
-        check(Evaluator.kingPressureMg(bishop, WHITE) > 0, "bishop pressure is nonzero");
-        check(Evaluator.kingPressureMg(rook, WHITE) > 0, "rook pressure is nonzero");
-        check(Evaluator.kingPressureMg(queen, WHITE) > 0, "queen pressure is nonzero");
-        check(Evaluator.kingPressureMg(bishop, WHITE) < 25, "one attacker remains small");
+        Board developed = board("6k1/8/8/8/8/1B6/N1NNN3/4K3 w - - 0 1");
+        check(Evaluator.kingPressureMg(developed, WHITE) > 0, "a developed slider attack is nonzero");
+        check(Evaluator.kingPressureMg(developed, WHITE) < 25, "one attacker remains small");
     }
 
     private static void testKingAttackUnitMapping() {
@@ -108,9 +105,42 @@ public final class EvaluatorTest {
         check(Evaluator.KING_ATTACK_UNIT[Piece.KING] == 0, "king has no king attack unit");
     }
 
+    private static void testKingDangerDevelopmentGate() {
+        check(Evaluator.kingPressureMg(new Board(), WHITE) == 0,
+                "undeveloped starting position has no king danger");
+
+        Board exactlyFour = board("6k1/8/8/8/6R1/2NQ4/1B6/RNB1K3 w - - 0 1");
+        check(Evaluator.kingPressureMg(exactlyFour, WHITE) == 0,
+                "four cleared back-rank slots do not activate king danger");
+
+        Board fiveMoved = board("6k1/8/8/8/6R1/N1NQ4/1B6/R1B1K3 w - - 0 1");
+        check(Evaluator.kingPressureMg(fiveMoved, WHITE) > 0,
+                "five moved back-rank slots activate king danger");
+
+        Board pawnsOnly = board("6k1/8/8/8/8/PPPPPPPP/8/RNBQKBNR w - - 0 1");
+        check(Evaluator.kingPressureMg(pawnsOnly, WHITE) == 0,
+                "pawns do not clear back-rank slots");
+
+        Board fifthExchanged = board("6k1/8/8/8/6R1/2NQ4/1B6/RN2K3 w - - 0 1");
+        check(Evaluator.kingPressureMg(fifthExchanged, WHITE) > 0,
+                "an exchanged fifth back-rank slot activates king danger");
+
+        Board blackFour = board("rnb1k3/1b6/2nq4/6r1/8/8/8/6K1 b - - 0 1");
+        Board blackFive = board("rn2k3/1b6/2nq4/6r1/8/8/8/6K1 b - - 0 1");
+        check(Evaluator.kingPressureMg(blackFour, BLACK) == 0,
+                "black exactly-four gate is symmetric");
+        check(Evaluator.kingPressureMg(blackFive, BLACK) > 0,
+                "black exactly-five gate activates symmetrically");
+
+        Board whiteToMove = fiveMoved;
+        Board blackToMove = board("6k1/8/8/8/6R1/N1NQ4/1B6/R1B1K3 b - - 0 1");
+        check(Evaluator.evaluate(whiteToMove) == -Evaluator.evaluate(blackToMove),
+                "king danger respects side-to-move perspective");
+    }
+
     private static void testNonlinearKingPressure() {
-        Board one = board("6k1/8/8/8/8/8/1B6/K7 w - - 0 1");
-        Board two = board("6k1/8/7N/8/8/8/1B6/K7 w - - 0 1");
+        Board one = board("6k1/8/8/8/8/1B6/N1NNN3/4K3 w - - 0 1");
+        Board two = board("6k1/8/7N/8/8/1B6/N1NN3/4K3 w - - 0 1");
         check(Evaluator.kingPressureMg(two, WHITE) > Evaluator.kingPressureMg(one, WHITE) + 4, "coordinated attackers escalate nonlinearly");
     }
 
@@ -123,13 +153,13 @@ public final class EvaluatorTest {
     }
 
     private static void testOccupiedOuterZonePressureIsRetained() {
-        Board occupied = board("6k1/8/5n2/8/8/8/1B6/K7 w - - 0 1");
+        Board occupied = board("6k1/8/5n2/8/8/8/NB1NNN3/4K3 w - - 0 1");
         check(Evaluator.kingPressureMg(occupied, WHITE) > 0, "bishop pressure on occupied f6 remains positive");
     }
 
     private static void testQueenAbsenceReduction() {
-        Board withQueen = board("6k1/8/8/8/8/8/1B2Q3/K7 w - - 0 1");
-        Board noQueen = board("6k1/8/8/8/8/8/1B6/K7 w - - 0 1");
+        Board withQueen = board("6k1/8/8/3Q4/8/8/NBNN4/4K3 w - - 0 1");
+        Board noQueen = board("6k1/8/8/8/8/8/NBNNN3/4K3 w - - 0 1");
         check(Evaluator.kingPressureMg(withQueen, WHITE) > Evaluator.kingPressureMg(noQueen, WHITE), "queen presence raises danger");
     }
 
@@ -157,11 +187,12 @@ public final class EvaluatorTest {
     }
 
     private static void testKingDangerPhaseTaper() {
-        Board ending = board("6k1/8/8/8/8/8/1B6/K7 w - - 0 1");
-        Board full = board("nnbbrrqk/8/8/8/8/8/1B6/QRRBBNNK w - - 0 1");
-        check(Evaluator.gamePhase(ending) == 1, "single bishop has residual phase");
+        Board ending = board("6k1/8/8/8/8/8/1B6/RNB1K3 w - - 0 1");
+        Board full = board("nnbbrrqk/8/2N5/8/3Q4/8/1B1N1R2/RB2K3 w - - 0 1");
+        check(Evaluator.gamePhase(ending) == 5, "low-material gate reference has residual phase");
         check(Evaluator.gamePhase(full) == Evaluator.PHASE_MAX, "full material reaches full phase");
-        check(evaluateActivityContribution(ending) < Evaluator.kingPressureMg(ending, WHITE), "danger tapers in low phase");
+        check(evaluateActivityContribution(ending) == 0 && Evaluator.kingPressureMg(ending, WHITE) == 0,
+                "undeveloped low-material danger is gated out");
         check(evaluateActivityContribution(full) != 0, "full-phase danger is applied");
     }
 
