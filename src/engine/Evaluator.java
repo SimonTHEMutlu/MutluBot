@@ -76,6 +76,9 @@ public final class Evaluator {
     private static final int SHELTER_MISSING_PAWN_MG = 14;
     private static final int SHELTER_MULTIPLE_WEAK_MG = 4;
     static final int KING_SHELTER_MG_CAP = 40;
+    // Missing forward cover costs a small amount per neighboring king file
+    // while the opposing queen is present. It fades with the normal MG phase.
+    private static final int QUEEN_PRESENT_MISSING_COVER_MG = 6;
 
     // Tables below are given in "a8..h8, a7..h7, ... a1..h1" reading order
     // (top of a printed board down to the bottom) and converted to our
@@ -107,8 +110,8 @@ public final class Evaluator {
             -20, -10, -5, -3, -3, -5, -10, -20,
             -10, -5,   0,   0,   0,   0, -5, -10,
               0,   0,  10,  20,  15,  10,   0,   0,
-              5,   5,  15,  17,  17,  15,   5,  5,
-              5,   0,  15,  17,  17,  15,   0, 5,
+              7,   10,  15,  17,  17,  15,   10,  7,
+              7,   0,  15,  17,  17,  15,   0, 7,
               0,   5,  15,  15,  15,  20,   5,   0,
             -5, -2,  0,   14,   14,   0, -2, -5,
             -10, -5,   0,   0,    0,   0, -5,  -10
@@ -358,12 +361,13 @@ static {
     }
 
     private static int kingDangerMg(Board b, int attackingColor) {
-        // Require five cleared back-rank slots before charging for king
-        // attacks. Moved and exchanged/captured N/B/R/Q/K pieces both clear a
-        // slot; pawns never do. This keeps the gate stable after trades.
-        if (developedOrExchangedNonPawnSlots(b, attackingColor) < 5) return 0;
-
         int defendingColor = opposite(attackingColor);
+        // Moved and exchanged/captured N/B/R/Q/K pieces both clear a slot;
+        // pawns never do. Skip attack generation until at least one slot clears.
+        int clearedSlots = developedOrExchangedNonPawnSlots(b, attackingColor);
+        int scale = kingDevelopmentScale(clearedSlots);
+        if (scale == 0) return 0;
+
         long innerZone = KING_INNER_ZONE[b.kingSquare(defendingColor)];
         long outerZone = KING_OUTER_ZONE[b.kingSquare(defendingColor)];
         long defendingOccupancy = b.occupancy[defendingColor];
@@ -447,7 +451,15 @@ static {
             danger = danger * KING_NO_QUEEN_NUMERATOR / KING_NO_QUEEN_DENOMINATOR;
         }
         danger += openFileDangerMg(b, attackingColor, defendingColor);
-        return Math.min(danger, KING_DANGER_MG_CAP);
+        int cappedDanger = Math.min(danger, KING_DANGER_MG_CAP);
+        if (cappedDanger == 0) return 0;
+        return (cappedDanger * scale + 63) / 64;
+    }
+
+    /** Quadratic king-danger multiplier in sixty-fourths, for focused tests. */
+    static int kingDevelopmentScale(int clearedSlots) {
+        int slots = Math.max(0, Math.min(8, clearedSlots));
+        return slots * slots;
     }
 
     private static int developedOrExchangedNonPawnSlots(Board b, int color) {
@@ -464,9 +476,10 @@ static {
         int kingSq = b.kingSquare(color);
         int kingRank = kingSq >>> 3;
         int kingFile = kingSq & 7;
+        int queenCoverPenalty = queenPresentMissingCoverPenaltyMg(b, color);
         // The shelter model is for castled/wing kings. Central d/e-file kings
         // are handled by development and open-center terms, not wing shelter.
-        if (kingFile >= 3 && kingFile <= 4) return 0;
+        if (kingFile >= 3 && kingFile <= 4) return queenCoverPenalty;
         int firstFile = Math.max(0, Math.min(5, kingFile - 1));
         int forward = color == WHITE ? 1 : -1;
         long pawns = b.pieceBB[color][PAWN];
@@ -497,7 +510,36 @@ static {
                 + farFiles * SHELTER_FAR_PAWN_MG
                 + missingFiles * SHELTER_MISSING_PAWN_MG;
         if (weakFiles >= 2) penalty += SHELTER_MULTIPLE_WEAK_MG;
-        return Math.min(penalty, KING_SHELTER_MG_CAP);
+        return Math.min(penalty + queenCoverPenalty, KING_SHELTER_MG_CAP);
+    }
+
+    /**
+     * Charges for absent forward pawn cover on king-adjacent files while the
+     * opponent still has a queen. A pawn anywhere ahead on its file counts;
+     * edge kings naturally have only two relevant files. This is kept
+     * separate from the distance-sensitive wing shelter term and is tapered
+     * by the evaluator's normal middlegame phase blend.
+     */
+    static int queenPresentMissingCoverPenaltyMg(Board b, int color) {
+        int enemy = opposite(color);
+        if (b.pieceBB[enemy][QUEEN] == 0L) return 0;
+        int kingSq = b.kingSquare(color);
+        int kingRank = kingSq >>> 3;
+        int kingFile = kingSq & 7;
+        int forward = color == WHITE ? 1 : -1;
+        long pawns = b.pieceBB[color][PAWN];
+        int missing = 0;
+        for (int file = Math.max(0, kingFile - 1); file <= Math.min(7, kingFile + 1); file++) {
+            boolean found = false;
+            for (int rank = kingRank + forward; rank >= 0 && rank < 8; rank += forward) {
+                if ((pawns & (1L << (rank * 8 + file))) != 0L) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) missing++;
+        }
+        return missing * QUEEN_PRESENT_MISSING_COVER_MG;
     }
 
     static int openFileDangerMg(Board b, int attackingColor, int defendingColor) {

@@ -14,6 +14,7 @@ public final class EvaluatorTest {
         testEnemyPawnProximityAndPhaseTaper();
         testKingAttackUnitMapping();
         testKingDangerDevelopmentGate();
+        testKingDevelopmentScale();
         testSinglePieceKingPressure();
         testNonlinearKingPressure();
         testCentralQueenOuterRayIsIgnored();
@@ -28,6 +29,7 @@ public final class EvaluatorTest {
         testPawnShelterOffBackRankAndEdgeClamp();
         testPawnShelterColorAndSideSymmetry();
         testPawnShelterPhaseTaper();
+        testQueenPresentForwardCover();
         testColorAndSideToMoveSymmetry();
         System.out.println("EvaluatorTest passed");
     }
@@ -110,12 +112,12 @@ public final class EvaluatorTest {
                 "undeveloped starting position has no king danger");
 
         Board exactlyFour = board("6k1/8/8/8/6R1/2NQ4/1B6/RNB1K3 w - - 0 1");
-        check(Evaluator.kingPressureMg(exactlyFour, WHITE) == 0,
-                "four cleared back-rank slots do not activate king danger");
+        check(Evaluator.kingPressureMg(exactlyFour, WHITE) > 0,
+                "four cleared back-rank slots permit scaled king danger");
 
         Board fiveMoved = board("6k1/8/8/8/6R1/N1NQ4/1B6/R1B1K3 w - - 0 1");
         check(Evaluator.kingPressureMg(fiveMoved, WHITE) > 0,
-                "five moved back-rank slots activate king danger");
+                "five moved back-rank slots permit king danger");
 
         Board pawnsOnly = board("6k1/8/8/8/8/PPPPPPPP/8/RNBQKBNR w - - 0 1");
         check(Evaluator.kingPressureMg(pawnsOnly, WHITE) == 0,
@@ -123,19 +125,38 @@ public final class EvaluatorTest {
 
         Board fifthExchanged = board("6k1/8/8/8/6R1/2NQ4/1B6/RN2K3 w - - 0 1");
         check(Evaluator.kingPressureMg(fifthExchanged, WHITE) > 0,
-                "an exchanged fifth back-rank slot activates king danger");
+                "an exchanged back-rank slot contributes to development scale");
 
         Board blackFour = board("rnb1k3/1b6/2nq4/6r1/8/8/8/6K1 b - - 0 1");
         Board blackFive = board("rn2k3/1b6/2nq4/6r1/8/8/8/6K1 b - - 0 1");
-        check(Evaluator.kingPressureMg(blackFour, BLACK) == 0,
-                "black exactly-four gate is symmetric");
+        check(Evaluator.kingPressureMg(blackFour, BLACK) > 0,
+                "black four-slot danger is scaled symmetrically");
         check(Evaluator.kingPressureMg(blackFive, BLACK) > 0,
-                "black exactly-five gate activates symmetrically");
+                "black five-slot danger is scaled symmetrically");
 
         Board whiteToMove = fiveMoved;
         Board blackToMove = board("6k1/8/8/8/6R1/N1NQ4/1B6/R1B1K3 b - - 0 1");
         check(Evaluator.evaluate(whiteToMove) == -Evaluator.evaluate(blackToMove),
                 "king danger respects side-to-move perspective");
+    }
+
+    private static void testKingDevelopmentScale() {
+        int previous = Evaluator.kingDevelopmentScale(0);
+        for (int slots = 1; slots <= 8; slots++) {
+            int scale = Evaluator.kingDevelopmentScale(slots);
+            check(scale > previous, "development scale rises at slot " + slots);
+            previous = scale;
+        }
+        check(Evaluator.kingDevelopmentScale(1) == 1,
+                "one cleared slot permits only 1/64 king danger");
+        check(Evaluator.kingDevelopmentScale(4) == 16
+                        && Evaluator.kingDevelopmentScale(5) == 25,
+                "four-to-five development step is gradual and quadratic");
+        check(Evaluator.kingDevelopmentScale(8) == 64,
+                "fully cleared back rank enables full king danger");
+        Board oneSlotAttacking = board("6k1/8/8/8/2B5/8/8/RNBQK1NR w - - 0 1");
+        check(Evaluator.kingPressureMg(oneSlotAttacking, WHITE) > 0,
+                "one cleared slot gives a small positive bonus for a real king-zone attack");
     }
 
     private static void testNonlinearKingPressure() {
@@ -191,8 +212,10 @@ public final class EvaluatorTest {
         Board full = board("nnbbrrqk/8/2N5/8/3Q4/8/1B1N1R2/RB2K3 w - - 0 1");
         check(Evaluator.gamePhase(ending) == 5, "low-material gate reference has residual phase");
         check(Evaluator.gamePhase(full) == Evaluator.PHASE_MAX, "full material reaches full phase");
-        check(evaluateActivityContribution(ending) == 0 && Evaluator.kingPressureMg(ending, WHITE) == 0,
-                "undeveloped low-material danger is gated out");
+        check(Evaluator.kingPressureMg(ending, WHITE) > 0,
+                "partly developed low-material danger uses the smooth scale");
+        check(evaluateActivityContribution(ending) < Evaluator.kingPressureMg(ending, WHITE),
+                "low-material king danger still tapers with phase");
         check(evaluateActivityContribution(full) != 0, "full-phase danger is applied");
     }
 
@@ -253,6 +276,40 @@ public final class EvaluatorTest {
         check(evaluateShelterContribution(pawnEnding) == 0, "shelter is absent in pawn ending");
         check(Evaluator.gamePhase(fullPhase) == Evaluator.PHASE_MAX, "full shelter phase");
         check(evaluateShelterContribution(fullPhase) == -14, "full shelter penalty is applied");
+    }
+
+    private static void testQueenPresentForwardCover() {
+        Board noQueen = board("7k/8/8/8/8/8/8/6K1 w - - 0 1");
+        Board queenAndNoCover = board("q6k/8/8/8/8/8/8/6K1 w - - 0 1");
+        check(Evaluator.queenPresentMissingCoverPenaltyMg(noQueen, WHITE) == 0,
+                "missing-cover penalty is absent without an enemy queen");
+        check(Evaluator.queenPresentMissingCoverPenaltyMg(queenAndNoCover, WHITE) == 18,
+                "queen exposes all three missing forward cover files");
+        Board centralNoQueen = board("7k/8/8/8/8/8/8/4K3 w - - 0 1");
+        Board centralEnemyQueen = board("q6k/8/8/8/8/8/8/4K3 w - - 0 1");
+        check(Evaluator.kingShelterPenaltyMg(centralNoQueen, WHITE) == 0
+                        && Evaluator.kingShelterPenaltyMg(centralEnemyQueen, WHITE) == 18,
+                "queen-present cover penalty is integrated for central kings");
+
+        Board coverAnywhere = board("q6k/8/8/8/5P2/8/8/6K1 w - - 0 1");
+        check(Evaluator.queenPresentMissingCoverPenaltyMg(coverAnywhere, WHITE) == 12,
+                "a pawn anywhere forward on its file counts as cover");
+
+        Board aFileKing = board("q6k/8/8/8/8/8/8/K7 w - - 0 1");
+        Board hFileKing = board("q6k/8/8/8/8/8/8/7K w - - 0 1");
+        check(Evaluator.queenPresentMissingCoverPenaltyMg(aFileKing, WHITE) == 12,
+                "a-file king checks only same and right files");
+        check(Evaluator.queenPresentMissingCoverPenaltyMg(hFileKing, WHITE) == 12,
+                "h-file king checks only left and same files");
+
+        Board whiteExposed = board("q5k1/8/8/8/8/8/8/6K1 w - - 0 1");
+        Board blackExposed = board("6k1/8/8/8/8/8/8/Q6K b - - 0 1");
+        check(Evaluator.queenPresentMissingCoverPenaltyMg(whiteExposed, WHITE)
+                        == Evaluator.queenPresentMissingCoverPenaltyMg(blackExposed, BLACK),
+                "queen-present cover penalty mirrors by color");
+        check(Evaluator.kingShelterPenaltyMg(whiteExposed, WHITE)
+                        == Evaluator.kingShelterPenaltyMg(blackExposed, BLACK),
+                "integrated queen-present cover penalty mirrors by color");
     }
 
     private static void testColorAndSideToMoveSymmetry() {
