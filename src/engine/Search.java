@@ -52,6 +52,8 @@ public class Search {
     private long lmrAttempts;
     private long lmrReducedSearches;
     private long lmrFullDepthResearches;
+    private long lmrReductionPlies;
+    private long lmrDeepReductions;
     private long seeCalls;
     private long mainTieBreakSeeCalls;
     private long qPruneSeeCalls;
@@ -62,6 +64,7 @@ public class Search {
     private long repetitionExits;
     private long fiftyMoveExits;
     private long deadlineNanos;
+    private long softTimeNanos;
     private boolean timeLimited;
 
     private int rootBestMove;
@@ -89,6 +92,8 @@ public class Search {
         public final long lmrAttempts;
         public final long lmrReducedSearches;
         public final long lmrFullDepthResearches;
+        public final long lmrReductionPlies;
+        public final long lmrDeepReductions;
         public final long seeCalls;
         public final long mainTieBreakSeeCalls;
         /** @deprecated use mainTieBreakSeeCalls. */
@@ -108,7 +113,8 @@ public class Search {
                             long ttBoundCutoffs, long mainSearchBetaCutoffs,
                             long quiescenceBetaCutoffs, long firstMoveCutoffs,
                             long legalMovesSearched, long lmrAttempts, long lmrReducedSearches,
-                            long lmrFullDepthResearches, long seeCalls, long mainTieBreakSeeCalls,
+                            long lmrFullDepthResearches, long lmrReductionPlies,
+                            long lmrDeepReductions, long seeCalls, long mainTieBreakSeeCalls,
                             long qPruneSeeCalls, long mainSeeDemotions, long nullMoveAttempts,
                             long nullMoveCutoffs, long aspirationRetries, long repetitionExits,
                             long fiftyMoveExits, boolean instrumentationEnabled) {
@@ -130,6 +136,8 @@ public class Search {
             this.lmrAttempts = lmrAttempts;
             this.lmrReducedSearches = lmrReducedSearches;
             this.lmrFullDepthResearches = lmrFullDepthResearches;
+            this.lmrReductionPlies = lmrReductionPlies;
+            this.lmrDeepReductions = lmrDeepReductions;
             this.seeCalls = seeCalls;
             this.mainTieBreakSeeCalls = mainTieBreakSeeCalls;
             this.mainOrderSeeCalls = mainTieBreakSeeCalls;
@@ -145,7 +153,7 @@ public class Search {
 
         private static SearchStats empty() {
             return new SearchStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
         }
 
         private static SearchStats capture(Search search) {
@@ -167,6 +175,8 @@ public class Search {
                     enabled ? search.lmrAttempts : 0,
                     enabled ? search.lmrReducedSearches : 0,
                     enabled ? search.lmrFullDepthResearches : 0,
+                    enabled ? search.lmrReductionPlies : 0,
+                    enabled ? search.lmrDeepReductions : 0,
                     enabled ? search.seeCalls : 0,
                     enabled ? search.mainTieBreakSeeCalls : 0,
                     enabled ? search.qPruneSeeCalls : 0,
@@ -198,6 +208,8 @@ public class Search {
                     + " lmrAttempts=" + lmrAttempts
                     + " lmrReduced=" + lmrReducedSearches
                     + " lmrResearch=" + lmrFullDepthResearches
+                    + " lmrReductionPlies=" + lmrReductionPlies
+                    + " lmrDeep=" + lmrDeepReductions
                     + " seeCalls=" + seeCalls
                     + " mainTieBreakSeeCalls=" + mainTieBreakSeeCalls
                     + " qSeePruneCalls=" + qPruneSeeCalls
@@ -258,6 +270,12 @@ public class Search {
      *                        The current root may be present as the final entry.
      */
     public int search(Board board, int maxDepth, long timeMillis, long[] gameHistoryKeys) {
+        return search(board, maxDepth, timeMillis, timeMillis, gameHistoryKeys);
+    }
+
+    /** Search with a soft completed-iteration target and an enforced hard deadline. */
+    public int search(Board board, int maxDepth, long softTimeMillis, long hardTimeMillis,
+                      long[] gameHistoryKeys) {
         stopRequested = false;
         nodes = 0;
         mainSearchNodes = 0;
@@ -276,6 +294,8 @@ public class Search {
         lmrAttempts = 0;
         lmrReducedSearches = 0;
         lmrFullDepthResearches = 0;
+        lmrReductionPlies = 0;
+        lmrDeepReductions = 0;
         seeCalls = 0;
         mainTieBreakSeeCalls = 0;
         qPruneSeeCalls = 0;
@@ -298,17 +318,39 @@ public class Search {
             System.arraycopy(gameHistoryKeys, 0, keyStack, 0, historyBase);
         }
 
-        timeLimited = timeMillis >= 0;
         long startNanos = System.nanoTime();
-        deadlineNanos = timeLimited ? startNanos + timeMillis * 1_000_000L : Long.MAX_VALUE;
+        long hardNanos = millisToNanos(hardTimeMillis);
+        timeLimited = hardTimeMillis >= 0 && hardNanos != Long.MAX_VALUE;
+        deadlineNanos = timeLimited ? deadlineAfter(startNanos, hardNanos) : Long.MAX_VALUE;
+        softTimeNanos = softTimeMillis >= 0 ? millisToNanos(softTimeMillis) : Long.MAX_VALUE;
 
         int depthLimit = maxDepth > 0 ? maxDepth : MAX_PLY - 4;
         rootBestMove = Move.NONE;
         int bestScore = 0;
         int window = 25; // centipawns, tunable
         int alpha, beta;
+        long lastIterationNanos = 0;
+        long previousIterationNanos = 0;
+        int stableIterations = 0;
+        int previousBestMove = Move.NONE;
+        int previousScore = 0;
 
         for (int depth = 1; depth <= depthLimit; depth++) {
+            long now = System.nanoTime();
+            long usedBeforeIteration = now - startNanos;
+            // Normal clock mode predicts only against the hard deadline. Soft
+            // stopping happens after an actual completed iteration; movetime
+            // uses equal soft/hard limits and remains deadline-driven.
+            if (timeLimited && softTimeNanos < hardNanos && lastIterationNanos > 0) {
+                double growthFactor = previousIterationNanos > 0
+                        ? Math.max(1.0, Math.min(3.0,
+                                (double) lastIterationNanos / previousIterationNanos)) : 2.0;
+                long growthEstimate = lastIterationNanos > Long.MAX_VALUE / growthFactor
+                        ? Long.MAX_VALUE : (long) (lastIterationNanos * growthFactor);
+                if (!SearchTimePolicy.shouldStartNextIteration(usedBeforeIteration,
+                        growthEstimate, hardNanos)) break;
+            }
+            long iterationStartNanos = now;
             iterationBestMove = Move.NONE;
             if(depth <= 2 || Math.abs(bestScore) >= MATE_SCORE - MAX_PLY - 10)
             {
@@ -324,6 +366,7 @@ public class Search {
             int score;
             while(true) {
                 score = negamax(board, depth, alpha, beta, 0, true);
+                if (stopRequested) break;
                 if(score <= alpha){
                     if (instrumentationEnabled) aspirationRetries++;
                     alpha = -INFINITY_SCORE; // fail low - widen and retry at the same depth
@@ -342,15 +385,24 @@ public class Search {
 
             bestScore = score;
             if (iterationBestMove != Move.NONE) rootBestMove = iterationBestMove;
+            if (rootBestMove == previousBestMove && Math.abs(bestScore - previousScore) <= 35) {
+                stableIterations++;
+            } else {
+                stableIterations = 0;
+            }
+            previousBestMove = rootBestMove;
+            previousScore = bestScore;
+            previousIterationNanos = lastIterationNanos;
+            lastIterationNanos = System.nanoTime() - iterationStartNanos;
 
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
             if (listener != null) reportInfo(board, depth, bestScore, elapsedMs);
 
             if (stopRequested) break;
-            if (timeLimited) {
-                long used = System.nanoTime() - startNanos;
-                long budget = deadlineNanos - startNanos;
-                if (used * 2 > budget) break; // unlikely to finish another iteration in time
+            long completedElapsedNanos = System.nanoTime() - startNanos;
+            if (timeLimited && SearchTimePolicy.shouldStopAtSoftAfterCompletedIteration(
+                    completedElapsedNanos, softTimeNanos, hardNanos, stableIterations >= 2)) {
+                break;
             }
             if (Math.abs(bestScore) >= MATE_SCORE - MAX_PLY) break; // forced mate found
         }
@@ -408,7 +460,19 @@ public class Search {
     }
 
     private boolean checkTime() {
-        return timeLimited && System.nanoTime() >= deadlineNanos;
+        return timeLimited && System.nanoTime() - deadlineNanos >= 0;
+    }
+
+    private static long millisToNanos(long millis) {
+        if (millis < 0 || millis >= Long.MAX_VALUE / 1_000_000L) return Long.MAX_VALUE;
+        return millis * 1_000_000L;
+    }
+
+    private static long deadlineAfter(long startNanos, long durationNanos) {
+        if (durationNanos == Long.MAX_VALUE || durationNanos > Long.MAX_VALUE / 2) {
+            return Long.MAX_VALUE;
+        }
+        return startNanos + durationNanos;
     }
 
     private boolean hasNonPawnMaterial(Board b, int color) {
@@ -557,12 +621,16 @@ public class Search {
                 score = -negamax(board, depth - 1, -beta, -alpha, searchPly + 1, true);
                 childRepetitionTainted = repetitionTainted[searchPly + 1];
             } else {
-                boolean quiet = !Move.isCapture(move) && !Move.isPromotion(move);
-                int reduction = (quiet && depth >= 3 && legalCount > 4) ? 1 : 0;
+                boolean givesCheck = board.isInCheck(board.sideToMove);
+                boolean advancedPasser = isAdvancedPassedPawnPush(board, move, us);
+                int reduction = lmrReductionForMove(move, depth, legalCount, searchPly,
+                        ttMove, inCheck, givesCheck, advancedPasser);
                 if (reduction > 0) {
                     if (instrumentationEnabled) {
                         lmrAttempts++;
                         lmrReducedSearches++;
+                        lmrReductionPlies += reduction;
+                        if (reduction >= 2) lmrDeepReductions++;
                     }
                 }
                 score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, searchPly + 1, true);
@@ -615,6 +683,42 @@ public class Search {
         if (searchPly == 0) iterationBestMove = bestMove;
 
         return bestScore;
+    }
+
+    /**
+     * Keeps the first four ordered legal moves at nominal depth. Later quiet
+     * moves get a one-ply scout, with deeper reductions as both depth and rank
+     * increase. This preserves the baseline search breadth before concentrating
+     * effort on the highest-ranked candidates.
+     */
+    static int lateMoveReduction(int depth, int moveRank) {
+        if (depth < 3 || moveRank <= 4) return 0;
+        int reduction = 1;
+        if (depth >= 4 && moveRank >= 6) {
+            int extra = ((depth - 3) * (moveRank - 5)) / 20;
+            reduction += Math.min(2, extra);
+        }
+        return Math.min(reduction, Math.max(0, depth - 2));
+    }
+
+    int lmrReductionForMove(int move, int depth, int moveRank, int searchPly,
+                            int ttMove, boolean inCheck, boolean givesCheck,
+                            boolean advancedPasser) {
+        if (inCheck || givesCheck || advancedPasser
+                || Move.isCapture(move) || Move.isPromotion(move)
+                || move == ttMove || searchPly < 0 || searchPly >= MAX_PLY
+                || move == killerMoves[searchPly][0] || move == killerMoves[searchPly][1]) {
+            return 0;
+        }
+        return lateMoveReduction(depth, moveRank);
+    }
+
+    boolean isAdvancedPassedPawnPush(Board positionAfterMove, int move, int moverColor) {
+        int to = Move.to(move);
+        if (positionAfterMove.pieceTypeAt(to) != PAWN
+                || !Evaluator.isPassedPawn(positionAfterMove, moverColor, to)) return false;
+        int rank = to >>> 3;
+        return moverColor == WHITE ? rank >= 4 : rank <= 3;
     }
 
     private int quiescence(Board board, int alpha, int beta, int searchPly) {

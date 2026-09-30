@@ -194,38 +194,43 @@ public class UCIEngine {
             }
         }
 
-        long timeBudget;
+        long softTimeBudget;
+        long hardTimeBudget;
         int depthLimit = depth;
 
         if (infinite) {
-            timeBudget = -1;
+            softTimeBudget = -1;
+            hardTimeBudget = -1;
         } else if (movetime >= 0) {
-            timeBudget = movetime;
+            ClockAllocation.Budget budget = ClockAllocation.forMoveTime(movetime);
+            softTimeBudget = budget.softMs;
+            hardTimeBudget = budget.hardMs;
         } else if (wtime >= 0 || btime >= 0) {
             long myTime = board.sideToMove == Piece.WHITE ? wtime : btime;
             long myInc = board.sideToMove == Piece.WHITE ? winc : binc;
-            if (myTime < 0) myTime = 5000;
-            int mtg = movestogo > 0 ? movestogo : 30;
-            long allocated = myTime / mtg + (long) (myInc * 0.8);
-            allocated -= 50; // overhead safety margin
-            long maxAllowed = myTime - 100;
-            if (allocated > maxAllowed) allocated = maxAllowed;
-            if (allocated < 20) allocated = 20;
-            timeBudget = allocated;
+            ClockAllocation.Budget budget = ClockAllocation.forClock(board.fullmoveNumber,
+                    myTime, myInc, movestogo);
+            softTimeBudget = budget.softMs;
+            hardTimeBudget = budget.hardMs;
         } else if (depth > 0) {
-            timeBudget = -1;
+            softTimeBudget = -1;
+            hardTimeBudget = -1;
         } else {
-            timeBudget = 5000; // sensible default if the GUI gave us nothing to go on
+            ClockAllocation.Budget budget = ClockAllocation.forMoveTime(5000);
+            softTimeBudget = budget.softMs;
+            hardTimeBudget = budget.hardMs;
         }
 
         long[] historyArray = new long[gameHistory.size()];
         for (int i = 0; i < historyArray.length; i++) historyArray[i] = gameHistory.get(i);
 
         final int fDepthLimit = depthLimit;
-        final long fTimeBudget = timeBudget;
+        final long fSoftTimeBudget = softTimeBudget;
+        final long fHardTimeBudget = hardTimeBudget;
 
         searchThread = new Thread(() -> {
-            int best = search.search(board, fDepthLimit, fTimeBudget, historyArray);
+            int best = search.search(board, fDepthLimit, fSoftTimeBudget,
+                    fHardTimeBudget, historyArray);
             send("bestmove " + Move.toUci(best));
         }, "search-thread");
         searchThread.start();
