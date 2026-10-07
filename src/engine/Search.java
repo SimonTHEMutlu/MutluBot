@@ -20,6 +20,94 @@ import static engine.Evaluator.*;
  * multi-ply PV table instead of reconstructing the PV from the TT, etc.
  */
 public class Search {
+    interface RootCandidateListener {
+        void onCandidate(int depth, int rank, String move, int score,
+                         boolean exact, long nodes, String pv);
+    }
+
+    interface ProphylaxisCandidateListener {
+        void onCandidate(int depth, String move, int normalScore, int threatScore,
+                         int adjustmentCp, long threatMetrics, String threatLine,
+                         int probeEvaluations);
+    }
+
+    interface ProphylaxisPlanListener {
+        void onPlan(String line, int rootScore);
+    }
+
+    static final class ProphylaxisDiagnostics {
+        final int depth;
+        final int baselineThreatScore;
+        final long baselineThreatMetrics;
+        final int candidatesProbed;
+        final int leafEvaluations;
+        final int orderingEvaluations;
+        final int verificationNodes;
+        final int checkedThreats;
+        final String selectedMove;
+        final int selectedNormalScore;
+        final int selectedThreatScore;
+        final int selectedAdjustmentCp;
+        final long selectedThreatMetrics;
+        final String selectedThreatLine;
+
+        private ProphylaxisDiagnostics(int depth, int baselineThreatScore,
+                                       long baselineThreatMetrics, int candidatesProbed,
+                                       int leafEvaluations, int orderingEvaluations,
+                                       int verificationNodes, int checkedThreats,
+                                       String selectedMove, int selectedNormalScore,
+                                       int selectedThreatScore, int selectedAdjustmentCp,
+                                       long selectedThreatMetrics, String selectedThreatLine) {
+            this.depth = depth;
+            this.baselineThreatScore = baselineThreatScore;
+            this.baselineThreatMetrics = baselineThreatMetrics;
+            this.candidatesProbed = candidatesProbed;
+            this.leafEvaluations = leafEvaluations;
+            this.orderingEvaluations = orderingEvaluations;
+            this.verificationNodes = verificationNodes;
+            this.checkedThreats = checkedThreats;
+            this.selectedMove = selectedMove;
+            this.selectedNormalScore = selectedNormalScore;
+            this.selectedThreatScore = selectedThreatScore;
+            this.selectedAdjustmentCp = selectedAdjustmentCp;
+            this.selectedThreatMetrics = selectedThreatMetrics;
+            this.selectedThreatLine = selectedThreatLine;
+        }
+
+        String toSummary() {
+            return "depth=" + depth
+                    + " baseline=" + baselineThreatScore
+                    + " baselineMetrics=" + formatThreatMetrics(baselineThreatMetrics)
+                    + " candidates=" + candidatesProbed
+                    + " leaves=" + leafEvaluations
+                    + " orderEvals=" + orderingEvaluations
+                    + " verifyNodes=" + verificationNodes
+                    + " checkedThreats=" + checkedThreats
+                    + " selected=" + selectedMove
+                    + " normal=" + selectedNormalScore
+                    + " threat=" + selectedThreatScore
+                    + " adjustment=" + selectedAdjustmentCp
+                    + " selectedMetrics=" + formatThreatMetrics(selectedThreatMetrics)
+                    + " line=" + selectedThreatLine;
+        }
+    }
+
+    private static final int PROPHYLAXIS_MIN_DEPTH = 3;
+    private static final int PROPHYLAXIS_MAX_CANDIDATES = 8;
+    private static final int PROPHYLAXIS_MAX_DIRECT_CANDIDATES = 2;
+    private static final int PROPHYLAXIS_MAX_PENDING_PROBES = 3;
+    private static final int PROPHYLAXIS_MAX_PENDING_ALTERNATIVES = 8;
+    private static final int PROPHYLAXIS_MAX_ROOT_RANK = 8;
+    private static final int PROPHYLAXIS_NORMAL_SCORE_BAND = 25;
+    private static final int PROPHYLAXIS_MAX_ADJUSTMENT = 12;
+    private static final int PROPHYLAXIS_MAX_EVALUATIONS = 512;
+    private static final int PROPHYLAXIS_BASELINE_EVALUATIONS = 64;
+    private static final int PROPHYLAXIS_CANDIDATE_EVALUATIONS = 64;
+    private static final int PROPHYLAXIS_FIRST_MOVE_LIMIT = 16;
+    private static final int PROPHYLAXIS_EVASION_LIMIT = 16;
+    private static final int PROPHYLAXIS_CONTINUATION_LIMIT = 3;
+    private static final int PROPHYLAXIS_MOVE_BUFFER = 256;
+
 
     public static final int MAX_PLY = 128;
 
@@ -69,6 +157,7 @@ public class Search {
 
     private int rootBestMove;
     private int iterationBestMove;
+    private int iterationReportedScore = Integer.MIN_VALUE;
     private int selDepth;
     private SearchStats lastStats = SearchStats.empty();
 
@@ -229,11 +318,44 @@ public class Search {
 
     private InfoListener listener;
     private boolean instrumentationEnabled;
+    private boolean lmrEnabled = true;
+    private RootCandidateListener rootCandidateListener;
+    private boolean prophylaxisProbeEnabled;
+    private ProphylaxisCandidateListener prophylaxisCandidateListener;
+    private ProphylaxisPlanListener prophylaxisPlanListener;
+    private ProphylaxisDiagnostics lastProphylaxisDiagnostics;
+    private final int[] prophylaxisMoves = new int[PROPHYLAXIS_MAX_CANDIDATES];
+    private final int[] prophylaxisNormalScores = new int[PROPHYLAXIS_MAX_CANDIDATES];
+    private final boolean[] prophylaxisCandidateExact = new boolean[PROPHYLAXIS_MAX_CANDIDATES];
+    private final int[] prophylaxisThreatScores = new int[PROPHYLAXIS_MAX_CANDIDATES];
+    private final int[] prophylaxisAdjustments = new int[PROPHYLAXIS_MAX_CANDIDATES];
+    private final long[] prophylaxisMetrics = new long[PROPHYLAXIS_MAX_CANDIDATES];
+    private final String[] prophylaxisLines = new String[PROPHYLAXIS_MAX_CANDIDATES];
+    private final int[] prophylaxisPendingMoves = new int[PROPHYLAXIS_MAX_PENDING_ALTERNATIVES];
+    private final int[] prophylaxisPendingScores = new int[PROPHYLAXIS_MAX_PENDING_ALTERNATIVES];
+    private final MoveList[] prophylaxisMoveLists = new MoveList[3];
+    private final int[][] prophylaxisOrderedMoves = new int[3][PROPHYLAXIS_FIRST_MOVE_LIMIT];
+    private final int[][] prophylaxisOrderedScores = new int[3][PROPHYLAXIS_FIRST_MOVE_LIMIT];
+    private final int[][] prophylaxisOrderedLeafScores = new int[3][PROPHYLAXIS_FIRST_MOVE_LIMIT];
+    private int prophylaxisCandidatesProbed;
+    private int prophylaxisLeaves;
+    private int prophylaxisOrderingEvaluations;
+    private int prophylaxisPendingCount;
+    private int prophylaxisCheckedThreats;
+    private int prophylaxisVerificationNodes;
+    private int prophylaxisEvaluations;
+    private int prophylaxisDepth;
+    private int prophylaxisBaselineScore;
+    private long prophylaxisBaselineMetrics;
+    private boolean prophylaxisBaselineReady;
 
     public Search(TranspositionTable tt) {
         this.tt = tt;
         for (int ply = 0; ply < MAX_PLY; ply++) {
             moveLists[ply] = new MoveList();
+        }
+        for (int i = 0; i < prophylaxisMoveLists.length; i++) {
+            prophylaxisMoveLists[i] = new MoveList();
         }
     }
 
@@ -260,6 +382,31 @@ public class Search {
         return lastStats;
     }
 
+    void setLmrEnabledForTesting(boolean enabled) {
+        lmrEnabled = enabled;
+    }
+
+    void setRootCandidateListener(RootCandidateListener listener) {
+        rootCandidateListener = listener;
+    }
+
+    /** Enables the bounded root threat experiment. Disabled by default. */
+    void setProphylaxisProbeEnabled(boolean enabled) {
+        prophylaxisProbeEnabled = enabled;
+    }
+
+    void setProphylaxisCandidateListener(ProphylaxisCandidateListener listener) {
+        prophylaxisCandidateListener = listener;
+    }
+
+    void setProphylaxisPlanListener(ProphylaxisPlanListener listener) {
+        prophylaxisPlanListener = listener;
+    }
+
+    ProphylaxisDiagnostics getLastProphylaxisDiagnostics() {
+        return lastProphylaxisDiagnostics;
+    }
+
     /**
      * Iterative deepening search from the current position on `board`.
      *
@@ -277,11 +424,13 @@ public class Search {
     public int search(Board board, int maxDepth, long softTimeMillis, long hardTimeMillis,
                       long[] gameHistoryKeys) {
         stopRequested = false;
+        lastProphylaxisDiagnostics = null;
         nodes = 0;
         mainSearchNodes = 0;
         quiescenceNodes = 0;
         evaluatorCalls = 0;
         maxSelectiveDepth = 0;
+        selDepth = 0;
         ttProbes = 0;
         ttHits = 0;
         ttExactHits = 0;
@@ -326,6 +475,18 @@ public class Search {
 
         int depthLimit = maxDepth > 0 ? maxDepth : MAX_PLY - 4;
         rootBestMove = Move.NONE;
+        iterationBestMove = Move.NONE;
+        MoveList rootMoves = new MoveList();
+        MoveGenerator.generateLegal(board, rootMoves);
+        if (rootMoves.size <= 1) {
+            rootBestMove = rootMoves.size == 1 ? rootMoves.get(0) : Move.NONE;
+            if (rootMoves.size == 0 && listener != null) {
+                int terminalScore = board.isInCheck(board.sideToMove) ? -MATE_SCORE : 0;
+                reportInfo(board, 1, terminalScore, (System.nanoTime() - startNanos) / 1_000_000L);
+            }
+            lastStats = SearchStats.capture(this);
+            return rootBestMove;
+        }
         int bestScore = 0;
         int window = 25; // centipawns, tunable
         int alpha, beta;
@@ -352,6 +513,7 @@ public class Search {
             }
             long iterationStartNanos = now;
             iterationBestMove = Move.NONE;
+            iterationReportedScore = Integer.MIN_VALUE;
             if(depth <= 2 || Math.abs(bestScore) >= MATE_SCORE - MAX_PLY - 10)
             {
                 alpha = -INFINITY_SCORE;
@@ -396,7 +558,9 @@ public class Search {
             lastIterationNanos = System.nanoTime() - iterationStartNanos;
 
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-            if (listener != null) reportInfo(board, depth, bestScore, elapsedMs);
+            if (listener != null) reportInfo(board, depth,
+                    iterationReportedScore == Integer.MIN_VALUE ? bestScore : iterationReportedScore,
+                    elapsedMs);
 
             if (stopRequested) break;
             long completedElapsedNanos = System.nanoTime() - startNanos;
@@ -573,7 +737,8 @@ public class Search {
                 }
             }
         }
-        if (nullOk && !inCheck && depth >= 3 && searchPly > 0 && hasNonPawnMaterial(board, board.sideToMove)) {
+        if (nullOk && !inCheck && depth >= 3 && searchPly > 0
+                && hasNonPawnMaterial(board, board.sideToMove)) {
             if (instrumentationEnabled) nullMoveAttempts++;
             board.makeNullMove();
             int score = -negamax(board, depth - 3, -beta, -beta + 1, searchPly + 1, false);
@@ -596,6 +761,10 @@ public class Search {
         int bestScore = -INFINITY_SCORE;
         int bestMove = Move.NONE;
         int us = board.sideToMove;
+        boolean probeThisRoot = searchPly == 0 && prophylaxisProbeEnabled
+                && depth >= PROPHYLAXIS_MIN_DEPTH
+                && isProphylaxisRootEligible(board, inCheck);
+        if (probeThisRoot) beginProphylaxisRoot(board, depth, us);
 
         for (int i = 0; i < moves.size; i++) {
             int bestIdx = i;
@@ -606,7 +775,9 @@ public class Search {
                 int tmpS = scores[i]; scores[i] = scores[bestIdx]; scores[bestIdx] = tmpS;
             }
             int move = moves.get(i);
-
+            long candidateStartNodes = searchPly == 0 && rootCandidateListener != null
+                    ? nodes : 0;
+            int candidateAlpha = alpha;
             board.makeMove(move);
             if (board.isInCheck(us)) {
                 board.unmakeMove();
@@ -624,7 +795,7 @@ public class Search {
                 boolean givesCheck = board.isInCheck(board.sideToMove);
                 boolean advancedPasser = isAdvancedPassedPawnPush(board, move, us);
                 int reduction = lmrReductionForMove(move, depth, legalCount, searchPly,
-                        ttMove, inCheck, givesCheck, advancedPasser);
+                        ttMove, inCheck, givesCheck, advancedPasser, board, us);
                 if (reduction > 0) {
                     if (instrumentationEnabled) {
                         lmrAttempts++;
@@ -642,7 +813,25 @@ public class Search {
                 }
             }
 
+            boolean candidateExact = score > candidateAlpha && score < beta;
+            if (probeThisRoot && candidateExact && legalCount <= PROPHYLAXIS_MAX_ROOT_RANK
+                    && !Move.isPromotion(move)
+                    && !board.isInCheck(board.sideToMove)
+                    && prophylaxisCandidatesProbed < PROPHYLAXIS_MAX_DIRECT_CANDIDATES
+                    && prophylaxisEvaluations < PROPHYLAXIS_MAX_EVALUATIONS) {
+                probeProphylaxisCandidate(board, move, score, depth, us);
+            } else if (probeThisRoot && !candidateExact && score <= candidateAlpha
+                    && legalCount <= PROPHYLAXIS_MAX_ROOT_RANK
+                    && !Move.isPromotion(move) && !board.isInCheck(board.sideToMove)) {
+                rememberProphylaxisAlternative(move, score);
+            }
             board.unmakeMove();
+            if (searchPly == 0 && rootCandidateListener != null) {
+                String pv = extractPv(board, depth, move);
+                rootCandidateListener.onCandidate(depth, legalCount, Move.toUci(move), score,
+                        candidateExact,
+                        nodes - candidateStartNodes, pv);
+            }
             if (childRepetitionTainted) repetitionTainted[searchPly] = true;
             if (stopRequested) return 0;
 
@@ -673,6 +862,30 @@ public class Search {
             return inCheck ? -(MATE_SCORE - searchPly) : 0;
         }
 
+        boolean rootExact = bestScore > origAlpha && bestScore < beta;
+        if (probeThisRoot && rootExact && !stopRequested) {
+            ensureBestProphylaxisCandidate(board, bestMove, bestScore, depth, us);
+            probePromisingPendingAlternatives(board, bestMove, bestScore, depth, us);
+            RootVerification verification = verifyBestProphylaxisAlternative(
+                    board, depth, bestMove, bestScore, us);
+            if (verification != null && verification.completed) {
+                if (verification.score > bestScore) {
+                    bestScore = verification.score;
+                    bestMove = verification.move;
+                }
+                if (!Move.isPromotion(verification.move)) {
+                    int slot = findProphylaxisCandidate(verification.move);
+                    if (slot >= 0) {
+                        prophylaxisNormalScores[slot] = verification.score;
+                        prophylaxisCandidateExact[slot] = true;
+                        prophylaxisAdjustments[slot] = computeProphylaxisAdjustment(
+                                prophylaxisThreatScores[slot], verification.score);
+                    }
+                }
+            }
+        }
+        rootExact = bestScore > origAlpha && bestScore < beta;
+
         int flag;
         if (bestScore <= origAlpha) flag = TranspositionTable.UPPER_BOUND;
         else if (bestScore >= beta) flag = TranspositionTable.LOWER_BOUND;
@@ -680,9 +893,693 @@ public class Search {
         if (!repetitionTainted[searchPly]) {
             tt.store(board.zobristKey, depth, adjustMateToTT(bestScore, searchPly), flag, bestMove);
         }
-        if (searchPly == 0) iterationBestMove = bestMove;
+        if (searchPly == 0) {
+            int selectedProbe = rootExact && !stopRequested
+                    ? selectProphylacticRootCandidate(bestMove, bestScore, depth) : -1;
+            if (selectedProbe >= 0) {
+                iterationBestMove = prophylaxisMoves[selectedProbe];
+                iterationReportedScore = prophylaxisNormalScores[selectedProbe];
+                updateProphylaxisDiagnostics(selectedProbe, depth);
+                return bestScore;
+            }
+            iterationBestMove = bestMove;
+            iterationReportedScore = bestScore;
+            finishProphylaxisDiagnostics(bestMove, bestScore, depth);
+        }
 
         return bestScore;
+    }
+
+    private boolean isProphylaxisRootEligible(Board board, boolean inCheck) {
+        // Quietness is assessed per candidate below. A single unrelated
+        // capture or checking move must not suppress all prophylaxis analysis.
+        return !inCheck && board.pieceBB[WHITE][QUEEN] != 0
+                && board.pieceBB[BLACK][QUEEN] != 0;
+    }
+
+    private void beginProphylaxisRoot(Board board, int depth, int defenderColor) {
+        prophylaxisDepth = depth;
+        prophylaxisCandidatesProbed = 0;
+        prophylaxisLeaves = 0;
+        prophylaxisOrderingEvaluations = 0;
+        prophylaxisPendingCount = 0;
+        prophylaxisCheckedThreats = 0;
+        prophylaxisVerificationNodes = 0;
+        prophylaxisEvaluations = 0;
+        prophylaxisBaselineReady = false;
+        prophylaxisBaselineScore = INFINITY_SCORE;
+        if (!shouldAbortProphylaxisWork()) {
+            prophylaxisBaselineMetrics = Evaluator.threatMetrics(board, defenderColor);
+        }
+
+        // Baseline: the root side passes once, then the opponent gets its
+        // first action. The probe itself inserts a second defender pass before
+        // the opponent's continuation.
+        board.makeNullMove();
+        try {
+            if (!shouldAbortProphylaxisWork() && !board.isInCheck(board.sideToMove)) {
+                ThreatProbeResult baseline = probeOpponentTwoActions(board, defenderColor,
+                        PROPHYLAXIS_BASELINE_EVALUATIONS);
+                if (baseline.evaluations > 0
+                        && baseline.rootScore != INFINITY_SCORE) {
+                    prophylaxisBaselineScore = baseline.rootScore;
+                    prophylaxisBaselineReady = true;
+                }
+            }
+        } finally {
+            board.unmakeNullMove();
+        }
+    }
+
+    private void probeProphylaxisCandidate(Board board, int move, int normalScore,
+                                            int depth, int defenderColor) {
+        probeProphylaxisCandidate(board, move, normalScore, depth, defenderColor, true);
+    }
+
+    private void probeProphylaxisCandidate(Board board, int move, int normalScore,
+                                            int depth, int defenderColor, boolean exact) {
+        int remaining = PROPHYLAXIS_MAX_EVALUATIONS - prophylaxisEvaluations;
+        int budget = Math.min(PROPHYLAXIS_CANDIDATE_EVALUATIONS, remaining);
+        if (budget <= 0) return;
+        if (shouldAbortProphylaxisWork()) return;
+        int beforeLeaves = prophylaxisLeaves;
+        long metrics = Evaluator.threatMetrics(board, defenderColor);
+        if (shouldAbortProphylaxisWork()) return;
+        ThreatProbeResult result = probeOpponentTwoActions(board, defenderColor, budget);
+        if (result.evaluations == 0 || result.rootScore == INFINITY_SCORE) return;
+
+        int slot = prophylaxisCandidatesProbed++;
+        prophylaxisMoves[slot] = move;
+        prophylaxisNormalScores[slot] = normalScore;
+        prophylaxisCandidateExact[slot] = exact;
+        prophylaxisThreatScores[slot] = result.rootScore;
+        prophylaxisMetrics[slot] = metrics;
+        prophylaxisLines[slot] = result.line;
+        int adjustment = computeProphylaxisAdjustment(result.rootScore, normalScore);
+        prophylaxisAdjustments[slot] = adjustment;
+        if (prophylaxisCandidateListener != null) {
+            prophylaxisCandidateListener.onCandidate(depth, Move.toUci(move), normalScore,
+                    result.rootScore, adjustment, metrics, result.line,
+                    result.evaluations);
+        }
+    }
+
+    private int computeProphylaxisAdjustment(int threatScore, int normalScore) {
+        int raw = (threatScore - normalScore) / 4;
+        return Math.max(-PROPHYLAXIS_MAX_ADJUSTMENT,
+                Math.min(PROPHYLAXIS_MAX_ADJUSTMENT, raw));
+    }
+
+    private void rememberProphylaxisAlternative(int move, int upperBound) {
+        int slot = 0;
+        while (slot < prophylaxisPendingCount
+                && (prophylaxisPendingScores[slot] > upperBound
+                    || (prophylaxisPendingScores[slot] == upperBound
+                        && prophylaxisPendingMoves[slot] < move))) {
+            slot++;
+        }
+        if (slot >= PROPHYLAXIS_MAX_PENDING_ALTERNATIVES) return;
+        int end = Math.min(prophylaxisPendingCount,
+                PROPHYLAXIS_MAX_PENDING_ALTERNATIVES - 1);
+        for (int i = end; i > slot; i--) {
+            prophylaxisPendingMoves[i] = prophylaxisPendingMoves[i - 1];
+            prophylaxisPendingScores[i] = prophylaxisPendingScores[i - 1];
+        }
+        prophylaxisPendingMoves[slot] = move;
+        prophylaxisPendingScores[slot] = upperBound;
+        if (prophylaxisPendingCount < PROPHYLAXIS_MAX_PENDING_ALTERNATIVES) {
+            prophylaxisPendingCount++;
+        }
+    }
+
+    private int findProphylaxisCandidate(int move) {
+        for (int i = 0; i < prophylaxisCandidatesProbed; i++) {
+            if (prophylaxisMoves[i] == move) return i;
+        }
+        return -1;
+    }
+
+    private void ensureBestProphylaxisCandidate(Board board, int bestMove,
+                                                 int bestScore, int depth, int moverColor) {
+        if (findProphylaxisCandidate(bestMove) >= 0
+                || prophylaxisCandidatesProbed >= PROPHYLAXIS_MAX_CANDIDATES
+                || Move.isPromotion(bestMove) || shouldAbortProphylaxisWork()) return;
+        board.makeMove(bestMove);
+        try {
+            if (!board.isInCheck(moverColor)
+                    && !board.isInCheck(board.sideToMove)) {
+                probeProphylaxisCandidate(board, bestMove, bestScore, depth, moverColor);
+            }
+        } finally {
+            board.unmakeMove();
+        }
+    }
+
+    private void probePromisingPendingAlternatives(Board board, int normalBestMove,
+                                                   int normalBestScore, int depth,
+                                                   int moverColor) {
+        int probed = 0;
+        for (int i = 0; i < prophylaxisPendingCount
+                && probed < PROPHYLAXIS_MAX_PENDING_PROBES
+                && prophylaxisCandidatesProbed < PROPHYLAXIS_MAX_CANDIDATES
+                && prophylaxisEvaluations < PROPHYLAXIS_MAX_EVALUATIONS; i++) {
+            int move = prophylaxisPendingMoves[i];
+            int upperBound = prophylaxisPendingScores[i];
+            if (move == normalBestMove || findProphylaxisCandidate(move) >= 0
+                    || upperBound < normalBestScore - PROPHYLAXIS_NORMAL_SCORE_BAND
+                    || Move.isPromotion(move) || shouldAbortProphylaxisWork()) continue;
+            board.makeMove(move);
+            try {
+                if (board.isInCheck(moverColor) || board.isInCheck(board.sideToMove)) continue;
+                probeProphylaxisCandidate(board, move, upperBound, depth, moverColor, false);
+                if (findProphylaxisCandidate(move) >= 0) probed++;
+            } finally {
+                board.unmakeMove();
+            }
+        }
+    }
+
+    private static final class RootVerification {
+        final int move;
+        final int score;
+        final boolean completed;
+
+        RootVerification(int move, int score, boolean completed) {
+            this.move = move;
+            this.score = score;
+            this.completed = completed;
+        }
+    }
+
+    private RootVerification verifyBestProphylaxisAlternative(Board board, int depth,
+                                                               int normalBestMove,
+                                                               int normalBestScore,
+                                                               int moverColor) {
+        int alternative = Move.NONE;
+        int alternativeSlot = -1;
+        int bestAdjusted = normalBestScore;
+        int normalSlot = findProphylaxisCandidate(normalBestMove);
+        if (normalSlot >= 0 && prophylaxisCandidateExact[normalSlot]) {
+            bestAdjusted += prophylaxisAdjustments[normalSlot];
+        }
+        int bestAlternativeAdjusted = bestAdjusted;
+        for (int i = 0; i < prophylaxisPendingCount; i++) {
+            if (prophylaxisPendingScores[i] < normalBestScore
+                    - PROPHYLAXIS_NORMAL_SCORE_BAND) continue;
+            int move = prophylaxisPendingMoves[i];
+            int slot = findProphylaxisCandidate(move);
+            if (slot < 0 || prophylaxisCandidateExact[slot]) continue;
+            int adjustedUpperBound = prophylaxisPendingScores[i]
+                    + prophylaxisAdjustments[slot];
+            if (adjustedUpperBound > bestAlternativeAdjusted) {
+                alternative = move;
+                alternativeSlot = slot;
+                bestAlternativeAdjusted = adjustedUpperBound;
+            }
+        }
+        if (alternative == Move.NONE || alternativeSlot < 0
+                || shouldAbortProphylaxisWork()) return null;
+
+        board.makeMove(alternative);
+        if (board.isInCheck(moverColor)) {
+            board.unmakeMove();
+            return null;
+        }
+        long beforeNodes = nodes;
+        int verifiedScore;
+        try {
+            int requiredNormalScore = bestAdjusted
+                    - prophylaxisAdjustments[alternativeSlot];
+            int thresholdChildScore = negamax(board, depth - 1,
+                    -INFINITY_SCORE, -requiredNormalScore, 1, true);
+            verifiedScore = -thresholdChildScore;
+            if (!stopRequested && !shouldAbortProphylaxisWork()
+                    && verifiedScore > requiredNormalScore) {
+                verifiedScore = -negamax(board, depth - 1,
+                        -INFINITY_SCORE, INFINITY_SCORE, 1, true);
+            } else {
+                return new RootVerification(alternative, verifiedScore, false);
+            }
+        } finally {
+            board.unmakeMove();
+            prophylaxisVerificationNodes += (int) Math.min(Integer.MAX_VALUE,
+                    Math.max(0L, nodes - beforeNodes));
+        }
+        if (stopRequested || shouldAbortProphylaxisWork()) {
+            return new RootVerification(alternative, verifiedScore, false);
+        }
+        return new RootVerification(alternative, verifiedScore, true);
+    }
+
+    private boolean shouldAbortProphylaxisWork() {
+        if (stopRequested) return true;
+        if (timeLimited && checkTime()) {
+            stopRequested = true;
+            return true;
+        }
+        return false;
+    }
+
+    private int selectProphylacticRootCandidate(int normalBestMove, int normalBestScore,
+                                                 int depth) {
+        if (!prophylaxisProbeEnabled || !prophylaxisBaselineReady
+                || prophylaxisDepth != depth || prophylaxisCandidatesProbed == 0
+                || normalBestScore <= -MATE_SCORE + MAX_PLY
+                || normalBestScore >= MATE_SCORE - MAX_PLY) return -1;
+
+        int selected = -1;
+        int selectedRank = normalBestScore;
+        for (int i = 0; i < prophylaxisCandidatesProbed; i++) {
+            if (!prophylaxisCandidateExact[i]) continue;
+            if (prophylaxisMoves[i] == normalBestMove) {
+                selected = i;
+                selectedRank = normalBestScore + prophylaxisAdjustments[i];
+                break;
+            }
+        }
+        for (int i = 0; i < prophylaxisCandidatesProbed; i++) {
+            if (!prophylaxisCandidateExact[i]) continue;
+            if (prophylaxisNormalScores[i] < normalBestScore - PROPHYLAXIS_NORMAL_SCORE_BAND) {
+                continue;
+            }
+            int adjusted = prophylaxisNormalScores[i] + prophylaxisAdjustments[i];
+            if (adjusted > selectedRank
+                    || (adjusted == selectedRank && selected >= 0
+                        && prophylaxisNormalScores[i] > prophylaxisNormalScores[selected])) {
+                selected = i;
+                selectedRank = adjusted;
+            }
+        }
+        return selected >= 0 && prophylaxisMoves[selected] != normalBestMove ? selected : -1;
+    }
+
+    private void finishProphylaxisDiagnostics(int move, int normalScore, int depth) {
+        if (!prophylaxisProbeEnabled || prophylaxisDepth != depth) return;
+        int selected = -1;
+        for (int i = 0; i < prophylaxisCandidatesProbed; i++) {
+            if (prophylaxisMoves[i] == move) {
+                selected = i;
+                break;
+            }
+        }
+        if (selected >= 0) updateProphylaxisDiagnostics(selected, depth);
+        else lastProphylaxisDiagnostics = new ProphylaxisDiagnostics(depth,
+                prophylaxisBaselineReady ? prophylaxisBaselineScore : INFINITY_SCORE,
+                prophylaxisBaselineMetrics, prophylaxisCandidatesProbed,
+                prophylaxisLeaves, prophylaxisOrderingEvaluations,
+                prophylaxisVerificationNodes, prophylaxisCheckedThreats, Move.toUci(move),
+                normalScore, INFINITY_SCORE, 0, 0L, "");
+    }
+
+    private void updateProphylaxisDiagnostics(int selected, int depth) {
+        lastProphylaxisDiagnostics = new ProphylaxisDiagnostics(depth,
+                prophylaxisBaselineReady ? prophylaxisBaselineScore : INFINITY_SCORE,
+                prophylaxisBaselineMetrics, prophylaxisCandidatesProbed,
+                prophylaxisLeaves, prophylaxisOrderingEvaluations,
+                prophylaxisVerificationNodes, prophylaxisCheckedThreats,
+                Move.toUci(prophylaxisMoves[selected]), prophylaxisNormalScores[selected],
+                prophylaxisThreatScores[selected], prophylaxisAdjustments[selected],
+                prophylaxisMetrics[selected], prophylaxisLines[selected]);
+    }
+
+    static final class ThreatProbeResult {
+        final int rootScore;
+        final int evaluations;
+        final int leaves;
+        final int orderedFirstMoves;
+        final int checkedThreats;
+        final String line;
+
+        ThreatProbeResult(int rootScore, int evaluations, int leaves,
+                          int orderedFirstMoves, int checkedThreats, String line) {
+            this.rootScore = rootScore;
+            this.evaluations = evaluations;
+            this.leaves = leaves;
+            this.orderedFirstMoves = orderedFirstMoves;
+            this.checkedThreats = checkedThreats;
+            this.line = line;
+        }
+    }
+
+    /**
+     * Estimates an opponent plan by allowing two opponent moves separated by
+     * an artificial pass. Checking first moves are followed through bounded
+     * legal defender evasions and attacker continuations; quiet first moves
+     * use the artificial-pass model. It performs static leaf evaluation only:
+     * no recursive search and no access to TT, repetition, killer, or history.
+     */
+    private ThreatProbeResult probeOpponentTwoActions(Board board, int defenderColor,
+                                                       int maxEvaluations) {
+        int startEvaluations = prophylaxisEvaluations;
+        if (maxEvaluations <= 0 || board.sideToMove != opposite(defenderColor)) {
+            return new ThreatProbeResult(INFINITY_SCORE, 0, 0, 0, 0, "");
+        }
+        int attacker = board.sideToMove;
+        int firstCount = orderProphylaxisMoves(board, defenderColor, 0,
+                PROPHYLAXIS_FIRST_MOVE_LIMIT, true, maxEvaluations, startEvaluations);
+        int checkedBefore = prophylaxisCheckedThreats;
+        int leaves = 0;
+        int worstRootScore = INFINITY_SCORE;
+        String worstLine = "";
+
+        for (int i = 0; i < firstCount
+                && prophylaxisEvaluations - startEvaluations < maxEvaluations; i++) {
+            if (shouldAbortProphylaxisWork()) break;
+            int first = prophylaxisOrderedMoves[0][i];
+            board.makeMove(first);
+            try {
+                if (board.isInCheck(attacker)) continue;
+                boolean givesCheck = board.isInCheck(defenderColor);
+                if (givesCheck) {
+                    prophylaxisCheckedThreats++;
+                    int evasionCount = orderProphylaxisMoves(board, defenderColor, 1,
+                            PROPHYLAXIS_EVASION_LIMIT, true, maxEvaluations,
+                            startEvaluations);
+                    if (evasionCount == 0 && shouldAbortProphylaxisWork()) break;
+                    if (evasionCount == 0) {
+                        int score = -MATE_SCORE + 2;
+                        String line = "CHECK " + Move.toUci(first) + " #";
+                        notifyProphylaxisPlan(line, score);
+                        if (score < worstRootScore) {
+                            worstRootScore = score;
+                            worstLine = line;
+                        }
+                        continue;
+                    }
+                    int bestDefenseScore = -INFINITY_SCORE;
+                    String bestDefenseLine = "";
+                    boolean completedCheckBranch = true;
+                    int processedEvasions = 0;
+                    for (int e = 0; e < evasionCount; e++) {
+                        if (prophylaxisEvaluations - startEvaluations >= maxEvaluations
+                                || prophylaxisEvaluations >= PROPHYLAXIS_MAX_EVALUATIONS) {
+                            completedCheckBranch = false;
+                            break;
+                        }
+                        if (shouldAbortProphylaxisWork()) {
+                            completedCheckBranch = false;
+                            break;
+                        }
+                        int evasion = prophylaxisOrderedMoves[1][e];
+                        board.makeMove(evasion);
+                        try {
+                            if (board.isInCheck(defenderColor)) continue;
+                            int continuationCount = orderProphylaxisMoves(board, defenderColor, 2,
+                                    PROPHYLAXIS_CONTINUATION_LIMIT, false, maxEvaluations,
+                                    startEvaluations);
+                            if (continuationCount == 0 && shouldAbortProphylaxisWork()) {
+                                completedCheckBranch = false;
+                                break;
+                            }
+                            if (continuationCount == 0) {
+                                int score = board.isInCheck(attacker)
+                                        ? MATE_SCORE - 3 : 0;
+                                String line = "CHECK " + Move.toUci(first) + " "
+                                        + Move.toUci(evasion) + (score == 0
+                                                ? " (stalemate)" : " #");
+                                if (score > bestDefenseScore) {
+                                    bestDefenseScore = score;
+                                    bestDefenseLine = line;
+                                }
+                                processedEvasions++;
+                                continue;
+                            }
+                            int bestAttackContinuation = INFINITY_SCORE;
+                            String bestContinuationLine = "";
+                            int processedContinuations = 0;
+                            for (int c = 0; c < continuationCount; c++) {
+                                if (prophylaxisEvaluations - startEvaluations >= maxEvaluations
+                                        || prophylaxisEvaluations >= PROPHYLAXIS_MAX_EVALUATIONS) {
+                                    completedCheckBranch = false;
+                                    break;
+                                }
+                                if (shouldAbortProphylaxisWork()) {
+                                    completedCheckBranch = false;
+                                    break;
+                                }
+                                int continuation = prophylaxisOrderedMoves[2][c];
+                                board.makeMove(continuation);
+                                try {
+                                    if (board.isInCheck(attacker)
+                                            || !consumeProphylaxisEvaluation(maxEvaluations,
+                                                    startEvaluations)) continue;
+                                    int score = Evaluator.evaluate(board);
+                                    prophylaxisLeaves++;
+                                    leaves++;
+                                    String line = "CHECK " + Move.toUci(first) + " "
+                                            + Move.toUci(evasion) + " "
+                                            + Move.toUci(continuation);
+                                    notifyProphylaxisPlan(line, score);
+                                    if (score < bestAttackContinuation) {
+                                        bestAttackContinuation = score;
+                                        bestContinuationLine = line;
+                                    }
+                                    processedContinuations++;
+                                } finally {
+                                    board.unmakeMove();
+                                }
+                            }
+                            if (processedContinuations != continuationCount) {
+                                completedCheckBranch = false;
+                            }
+                            if (bestAttackContinuation == INFINITY_SCORE) {
+                                completedCheckBranch = false;
+                            }
+                            if (bestAttackContinuation != INFINITY_SCORE
+                                    && bestAttackContinuation > bestDefenseScore) {
+                                bestDefenseScore = bestAttackContinuation;
+                                bestDefenseLine = bestContinuationLine;
+                            }
+                            if (completedCheckBranch) processedEvasions++;
+                        } finally {
+                            board.unmakeMove();
+                        }
+                    }
+                    if (processedEvasions != evasionCount) completedCheckBranch = false;
+                    if (completedCheckBranch && bestDefenseScore != -INFINITY_SCORE) {
+                        notifyProphylaxisPlan(bestDefenseLine, bestDefenseScore);
+                        if (bestDefenseScore < worstRootScore) {
+                            worstRootScore = bestDefenseScore;
+                            worstLine = bestDefenseLine;
+                        }
+                    }
+                    continue;
+                }
+
+                if (!MoveGenerator.hasLegalMove(board)) continue; // stalemate
+                board.makeNullMove();
+                try {
+                    // The pass represents a hypothetical missed defensive
+                    // move and is only legal as a model when not in check.
+                    if (board.isInCheck(defenderColor)) continue;
+                    int continuationCount = orderProphylaxisMoves(board, defenderColor, 2,
+                            PROPHYLAXIS_CONTINUATION_LIMIT, false, maxEvaluations,
+                            startEvaluations);
+                    if (continuationCount == 0 && shouldAbortProphylaxisWork()) continue;
+                    if (continuationCount == 0) {
+                        int score = board.isInCheck(attacker) ? MATE_SCORE - 2 : 0;
+                        String line = "PASS " + Move.toUci(first)
+                                + (score == 0 ? " (stalemate)" : " #");
+                        notifyProphylaxisPlan(line, score);
+                        if (score < worstRootScore) {
+                            worstRootScore = score;
+                            worstLine = line;
+                        }
+                    }
+                    int bestContinuationScore = INFINITY_SCORE;
+                    String bestContinuationLine = "";
+                    int processedContinuations = 0;
+                    for (int c = 0; c < continuationCount; c++) {
+                        if (prophylaxisEvaluations - startEvaluations >= maxEvaluations
+                                || prophylaxisEvaluations >= PROPHYLAXIS_MAX_EVALUATIONS) break;
+                        if (shouldAbortProphylaxisWork()) break;
+                        int continuation = prophylaxisOrderedMoves[2][c];
+                        board.makeMove(continuation);
+                        try {
+                            if (board.isInCheck(attacker)
+                                    || !consumeProphylaxisEvaluation(maxEvaluations,
+                                            startEvaluations)) continue;
+                            int score = Evaluator.evaluate(board);
+                            prophylaxisLeaves++;
+                            leaves++;
+                            String line = "PASS " + Move.toUci(first) + " "
+                                    + Move.toUci(continuation);
+                            notifyProphylaxisPlan(line, score);
+                            if (score < bestContinuationScore) {
+                                bestContinuationScore = score;
+                                bestContinuationLine = line;
+                            }
+                            processedContinuations++;
+                        } finally {
+                            board.unmakeMove();
+                        }
+                    }
+                    if (processedContinuations == continuationCount
+                            && bestContinuationScore != INFINITY_SCORE
+                            && bestContinuationScore < worstRootScore) {
+                        worstRootScore = bestContinuationScore;
+                        worstLine = bestContinuationLine;
+                    }
+                } finally {
+                    board.unmakeNullMove();
+                }
+            } finally {
+                board.unmakeMove();
+            }
+        }
+        return new ThreatProbeResult(worstRootScore,
+                prophylaxisEvaluations - startEvaluations, leaves, firstCount,
+                prophylaxisCheckedThreats - checkedBefore, worstLine);
+    }
+
+    private int orderProphylaxisMoves(Board board, int defenderColor, int level,
+                                      int limit, boolean staticOrder,
+                                      int maxEvaluations, int evaluationStart) {
+        if (limit <= 0 || shouldAbortProphylaxisWork()) return 0;
+        int moverColor = board.sideToMove;
+        MoveList pseudo = prophylaxisMoveLists[level];
+        pseudo.clear();
+        MoveGenerator.generatePseudoLegal(board, pseudo, false);
+        int count = 0;
+        int legalScanned = 0;
+        int[] orderedMoves = prophylaxisOrderedMoves[level];
+        int[] orderedScores = prophylaxisOrderedScores[level];
+        for (int i = 0; i < pseudo.size && legalScanned < PROPHYLAXIS_MOVE_BUFFER; i++) {
+            if (shouldAbortProphylaxisWork()) break;
+            int move = pseudo.get(i);
+            int captureScore = Move.isCapture(move) ? mvvLva(board, move) : 0;
+            board.makeMove(move);
+            int priority;
+            boolean legal;
+            try {
+                legal = !board.isInCheck(moverColor);
+                if (!legal) continue;
+                legalScanned++;
+                priority = prophylaxisMovePriority(board, move, moverColor,
+                        defenderColor, captureScore);
+            } finally {
+                board.unmakeMove();
+            }
+            count = insertOrderedProphylaxisMove(orderedMoves, orderedScores,
+                    count, limit, move, priority);
+        }
+
+        if (staticOrder) {
+            int[] leafScores = prophylaxisOrderedLeafScores[level];
+            for (int i = 0; i < count; i++) {
+                if (prophylaxisEvaluations - evaluationStart >= maxEvaluations
+                        || prophylaxisEvaluations >= PROPHYLAXIS_MAX_EVALUATIONS
+                        || shouldAbortProphylaxisWork()) break;
+                int move = orderedMoves[i];
+                board.makeMove(move);
+                try {
+                    if (board.isInCheck(moverColor)) continue;
+                    int eval = Evaluator.evaluate(board);
+                    prophylaxisEvaluations++;
+                    prophylaxisOrderingEvaluations++;
+                    leafScores[i] = eval;
+                    int moverPerspective = -eval;
+                    orderedScores[i] += Math.max(-3000, Math.min(3000, moverPerspective));
+                } finally {
+                    board.unmakeMove();
+                }
+            }
+            sortOrderedProphylaxisMoves(orderedMoves, orderedScores, leafScores, count);
+        }
+        return count;
+    }
+
+    private int prophylaxisMovePriority(Board afterMove, int move, int moverColor,
+                                        int defenderColor, int captureScore) {
+        int priority = 0;
+        boolean check = moverColor != defenderColor && afterMove.isInCheck(defenderColor);
+        if (check) {
+            boolean safe = !afterMove.isSquareAttacked(Move.to(move), defenderColor);
+            priority += safe ? 100000 : 90000;
+        }
+        if (captureScore != 0) priority += 20000 + captureScore;
+        if (Move.isPromotion(move)) priority += 40000;
+        if (moverColor == defenderColor
+                && afterMove.pieceTypeAt(Move.to(move)) == KING) priority += 15000;
+
+        int from = Move.from(move);
+        int to = Move.to(move);
+        if (afterMove.pieceTypeAt(to) == PAWN && moverColor != defenderColor) {
+            int king = afterMove.kingSquare(defenderColor);
+            int kingFile = king & 7;
+            int toFile = to & 7;
+            int fromRankDistance = Math.abs((from >>> 3) - (king >>> 3));
+            int toRankDistance = Math.abs((to >>> 3) - (king >>> 3));
+            if (Math.abs(toFile - kingFile) <= 1 && toRankDistance < fromRankDistance) {
+                priority += 12000;
+            }
+        }
+        return priority;
+    }
+
+    private int insertOrderedProphylaxisMove(int[] moves, int[] scores, int count,
+                                             int limit, int move, int score) {
+        int slot = 0;
+        while (slot < count && (scores[slot] > score
+                || (scores[slot] == score && moves[slot] < move))) slot++;
+        if (slot >= limit) return count;
+        int newCount = Math.min(limit, count + 1);
+        for (int i = newCount - 1; i > slot; i--) {
+            moves[i] = moves[i - 1];
+            scores[i] = scores[i - 1];
+        }
+        moves[slot] = move;
+        scores[slot] = score;
+        return newCount;
+    }
+
+    private void sortOrderedProphylaxisMoves(int[] moves, int[] scores,
+                                              int[] leafScores, int count) {
+        for (int i = 1; i < count; i++) {
+            int move = moves[i];
+            int score = scores[i];
+            int leaf = leafScores[i];
+            int j = i;
+            while (j > 0 && (scores[j - 1] < score
+                    || (scores[j - 1] == score && moves[j - 1] > move))) {
+                moves[j] = moves[j - 1];
+                scores[j] = scores[j - 1];
+                leafScores[j] = leafScores[j - 1];
+                j--;
+            }
+            moves[j] = move;
+            scores[j] = score;
+            leafScores[j] = leaf;
+        }
+    }
+
+    private boolean consumeProphylaxisEvaluation(int localLimit, int localStart) {
+        if (shouldAbortProphylaxisWork()
+                || prophylaxisEvaluations - localStart >= localLimit
+                || prophylaxisEvaluations >= PROPHYLAXIS_MAX_EVALUATIONS) return false;
+        prophylaxisEvaluations++;
+        return true;
+    }
+
+    private void notifyProphylaxisPlan(String line, int score) {
+        if (prophylaxisPlanListener != null) prophylaxisPlanListener.onPlan(line, score);
+    }
+
+    ThreatProbeResult probeOpponentTwoActionsForTesting(Board board, int defenderColor,
+                                                          int evaluationBudget) {
+        prophylaxisEvaluations = 0;
+        prophylaxisLeaves = 0;
+        prophylaxisOrderingEvaluations = 0;
+        prophylaxisCheckedThreats = 0;
+        return probeOpponentTwoActions(board, defenderColor, evaluationBudget);
+    }
+
+    static String formatThreatMetrics(long metrics) {
+        return "safeChecks=" + Evaluator.threatSafeCheckCount(metrics)
+                + ",kingPressure=" + Evaluator.threatKingPressure(metrics)
+                + ",pawnBreaks=" + Evaluator.threatPawnBreakCount(metrics)
+                + ",openKingFiles=" + Evaluator.threatOpenKingFileCount(metrics)
+                + ",semiOpenKingFiles=" + Evaluator.threatSemiOpenKingFileCount(metrics);
     }
 
     /**
@@ -704,13 +1601,40 @@ public class Search {
     int lmrReductionForMove(int move, int depth, int moveRank, int searchPly,
                             int ttMove, boolean inCheck, boolean givesCheck,
                             boolean advancedPasser) {
-        if (inCheck || givesCheck || advancedPasser
+        if (!lmrEnabled
+                || inCheck || givesCheck || advancedPasser
                 || Move.isCapture(move) || Move.isPromotion(move)
                 || move == ttMove || searchPly < 0 || searchPly >= MAX_PLY
                 || move == killerMoves[searchPly][0] || move == killerMoves[searchPly][1]) {
             return 0;
         }
         return lateMoveReduction(depth, moveRank);
+    }
+
+    int lmrReductionForMove(int move, int depth, int moveRank, int searchPly,
+                            int ttMove, boolean inCheck, boolean givesCheck,
+                            boolean advancedPasser, Board positionAfterMove, int moverColor) {
+        if (isNearRootPawnOffer(positionAfterMove, move, moverColor, searchPly)) return 0;
+        return lmrReductionForMove(move, depth, moveRank, searchPly,
+                ttMove, inCheck, givesCheck, advancedPasser);
+    }
+
+    /**
+     * A quiet pawn move near the root that can be taken by an enemy pawn is
+     * searched at nominal depth. This gives sound gambits such as 2.c4 their
+     * tactical verification while also making unsound pawn offers visible to
+     * the same full-depth search. The two-ply bound keeps the extra work local.
+     * The board must be in the position immediately after {@code move}.
+     */
+    boolean isNearRootPawnOffer(Board positionAfterMove, int move, int moverColor,
+                                int searchPly) {
+        if (searchPly > 1 || searchPly < 0 || Move.isCapture(move)
+                || Move.isPromotion(move) || positionAfterMove.pieceTypeAt(Move.to(move)) != PAWN) {
+            return false;
+        }
+        int enemy = opposite(moverColor);
+        return (Bitboards.PAWN_ATTACKS[moverColor][Move.to(move)]
+                & positionAfterMove.pieceBB[enemy][PAWN]) != 0;
     }
 
     boolean isAdvancedPassedPawnPush(Board positionAfterMove, int move, int moverColor) {

@@ -10,7 +10,7 @@ import java.util.List;
  * such as SCID vs PC, Arena, or CuteChess talks to over stdin/stdout.
  *
  * Supported commands: uci, isready, ucinewgame, position, go, stop,
- * setoption (Hash), quit. Also a couple of small debug extras: "d" prints
+ * setoption (Hash, ProphylaxisProbe), quit. Also a couple of small debug extras: "d" prints
  * the board, "perft N" runs a perft test from the current position.
  */
 public class UCIEngine {
@@ -21,6 +21,7 @@ public class UCIEngine {
     private Board board = new Board();
     private TranspositionTable tt = new TranspositionTable(64); // MB
     private Search search = new Search(tt);
+    private boolean prophylaxisProbeEnabled = true;
     private final List<Long> gameHistory = new ArrayList<>();
 
     private Thread searchThread;
@@ -32,6 +33,7 @@ public class UCIEngine {
     private void run() {
         gameHistory.add(board.zobristKey);
         search.setInfoListener(this::printInfo);
+        search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
 
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         String line;
@@ -56,6 +58,7 @@ public class UCIEngine {
                 send("id name " + ENGINE_NAME);
                 send("id author " + ENGINE_AUTHOR);
                 send("option name Hash type spin default 64 min 1 max 4096");
+                send("option name ProphylaxisProbe type check default true");
                 send("uciok");
                 break;
             case "isready":
@@ -231,9 +234,13 @@ public class UCIEngine {
         searchThread = new Thread(() -> {
             int best = search.search(board, fDepthLimit, fSoftTimeBudget,
                     fHardTimeBudget, historyArray);
-            send("bestmove " + Move.toUci(best));
+            send("bestmove " + formatBestMove(best));
         }, "search-thread");
         searchThread.start();
+    }
+
+    static String formatBestMove(int move) {
+        return move == Move.NONE ? "0000" : Move.toUci(move);
     }
 
     private void stopSearchIfRunning() {
@@ -263,8 +270,13 @@ public class UCIEngine {
                 tt = new TranspositionTable(mb);
                 search = new Search(tt);
                 search.setInfoListener(this::printInfo);
+                search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
             } catch (NumberFormatException ignored) {
             }
+        } else if (name.equalsIgnoreCase("ProphylaxisProbe")) {
+            prophylaxisProbeEnabled = value.equalsIgnoreCase("true")
+                    || value.equalsIgnoreCase("on") || value.equals("1");
+            search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
         }
         // Other options (e.g. Threads) can be added here as the engine grows.
     }
