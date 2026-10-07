@@ -423,7 +423,25 @@ public class Search {
     /** Search with a soft completed-iteration target and an enforced hard deadline. */
     public int search(Board board, int maxDepth, long softTimeMillis, long hardTimeMillis,
                       long[] gameHistoryKeys) {
+        return searchInternal(board, maxDepth, softTimeMillis, hardTimeMillis,
+                gameHistoryKeys, true);
+    }
+
+    /** Prepares a UCI-owned worker search so an early stop request is not lost. */
+    void clearStopRequestForNextSearch() {
         stopRequested = false;
+    }
+
+    int searchPrepared(Board board, int maxDepth, long softTimeMillis, long hardTimeMillis,
+                       long[] gameHistoryKeys) {
+        return searchInternal(board, maxDepth, softTimeMillis, hardTimeMillis,
+                gameHistoryKeys, false);
+    }
+
+    private int searchInternal(Board board, int maxDepth, long softTimeMillis,
+                               long hardTimeMillis, long[] gameHistoryKeys,
+                               boolean resetStopRequest) {
+        if (resetStopRequest) stopRequested = false;
         lastProphylaxisDiagnostics = null;
         nodes = 0;
         mainSearchNodes = 0;
@@ -576,6 +594,13 @@ public class Search {
             MoveGenerator.generateLegal(board, legal);
             if (legal.size > 0) rootBestMove = legal.get(0);
         }
+        // Keep the UCI boundary safe if a root-selection path propagates a
+        // stale or malformed packed move.
+        if (!isLegalInPosition(board, rootBestMove)) {
+            MoveList legal = new MoveList();
+            MoveGenerator.generateLegal(board, legal);
+            rootBestMove = legal.size > 0 ? legal.get(0) : Move.NONE;
+        }
         lastStats = SearchStats.capture(this);
         return rootBestMove;
     }
@@ -603,9 +628,13 @@ public class Search {
             if (i == 0 && reportedRootMove != Move.NONE) {
                 move = reportedRootMove;
             } else {
-                TranspositionTable.Probe p = tt.probe(board.zobristKey);
-                if (p == null || p.move == Move.NONE) break;
-                move = p.move;
+                long entry = tt.probePacked(board.zobristKey);
+                int requiredDepth = Math.max(1, maxLen - i);
+                if (entry == 0 || !tt.isCurrentGeneration(entry)
+                        || TranspositionTable.flagOf(entry) != TranspositionTable.EXACT
+                        || TranspositionTable.depthOf(entry) < requiredDepth) break;
+                move = TranspositionTable.moveOf(entry);
+                if (move == Move.NONE) break;
             }
             if (!isLegalInPosition(board, move)) break;
             board.makeMove(move);
@@ -716,10 +745,16 @@ public class Search {
             if (instrumentationEnabled) ttHits++;
             ttMove = TranspositionTable.moveOf(entry);
             if (instrumentationEnabled && ttMove != Move.NONE) ttMoveAvailable++;
+            // A root TT cutoff supplies the move returned to the GUI. Validate
+            // it before trusting an exact score or bound; malformed entries
+            // must not become bestmove.
+            boolean usableRootTtMove = searchPly != 0
+                    || (ttMove != Move.NONE && isLegalInPosition(board, ttMove));
+            if (!usableRootTtMove) ttMove = Move.NONE;
             // A TT score is safe only inside the search that produced it, and
             // not when this position has already occurred on the actual-game
             // history or active line. The move remains useful for ordering.
-            if (!repetitionSensitive && tt.isCurrentGeneration(entry)
+            if (usableRootTtMove && !repetitionSensitive && tt.isCurrentGeneration(entry)
                     && TranspositionTable.depthOf(entry) >= depth) {
                 int score = adjustMateFromTT(TranspositionTable.scoreOf(entry), searchPly);
                 int flag = TranspositionTable.flagOf(entry);

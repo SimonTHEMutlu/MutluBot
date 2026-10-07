@@ -21,6 +21,8 @@ public final class SearchCorrectnessTest {
         testGameOneAvoidsSearchCycle();
         testQuiescenceTwofoldSearchCycleIsDraw();
         testStaleTranspositionCannotForceThirdRepetition();
+        testIllegalRootTranspositionMoveCannotBecomeBestMove();
+        testPvStopsAtStaleOrNonExactTtEntries();
         testCheckmatePrecedesFiftyMoveDraw();
         testFiftyMoveDraw();
         System.out.println("SearchCorrectnessTest passed");
@@ -233,6 +235,70 @@ public final class SearchCorrectnessTest {
                         + ", pv=" + result.pv);
     }
 
+    /** Regression for Lichess game qJGISQlH, after 43.Qxf7+. */
+    private static void testIllegalRootTranspositionMoveCannotBecomeBestMove() {
+        Board board = board("8/5Qp1/pR5q/3pPk2/3P1P1p/6PP/8/1b4K1 b - - 0 43");
+        TranspositionTable tt = new TranspositionTable(1);
+        Search search = new Search(tt);
+        SearchResult result = new SearchResult();
+        int illegalMove = Move.encode(48, 53, Move.QUIET); // a7f7; a7 is empty.
+        search.setInfoListener((depth, selDepth, score, mate, mateIn,
+                                nodes, nps, timeMs, pv) -> {
+            if (depth == 1) {
+                // Plant a same-generation exact root entry between iterative
+                // deepening iterations, as could happen after TT corruption.
+                tt.store(board.zobristKey, 2, score,
+                        TranspositionTable.EXACT, illegalMove);
+            }
+            if (depth == 2) {
+                result.pv = pv;
+            }
+        });
+
+        result.move = search.search(board, 2, -1, null);
+        String bestMove = Move.toUci(result.move);
+        check(isLegalMove(board, result.move),
+                "search must return a legal move after rejecting stale root TT data; got "
+                        + bestMove);
+        check(!bestMove.equals("a7f7"),
+                "illegal root TT move a7f7 must not become bestmove");
+        check(result.pv != null && result.pv.startsWith(bestMove),
+                "reported PV must begin with a legal bestmove; bestmove=" + bestMove
+                        + ", pv=" + result.pv);
+        check(!result.pv.contains("a7f7"),
+                "reported PV must exclude the stale illegal move; pv=" + result.pv);
+    }
+
+    private static void testPvStopsAtStaleOrNonExactTtEntries() {
+        Board root = new Board();
+        int firstMove = findLegalMove(root, "e2e4");
+        Board child = board(root.toFen());
+        child.makeMove(firstMove);
+        int reply = findLegalMove(child, "a7a6");
+        TranspositionTable tt = new TranspositionTable(1);
+        Search search = new Search(tt);
+        tt.newSearch();
+        tt.store(child.zobristKey, 2, 0, TranspositionTable.UPPER_BOUND, reply);
+        check(extractPv(search, root, 4, firstMove).equals("e2e4"),
+                "PV extraction must stop before a bound TT move");
+
+        tt.store(child.zobristKey, 2, 0, TranspositionTable.EXACT, reply);
+        tt.newSearch(); // entry is now stale for this top-level search
+        check(extractPv(search, root, 4, firstMove).equals("e2e4"),
+                "PV extraction must stop before a stale-generation TT move");
+    }
+
+    private static String extractPv(Search search, Board board, int length, int rootMove) {
+        try {
+            Method method = Search.class.getDeclaredMethod(
+                    "extractPv", Board.class, int.class, int.class);
+            method.setAccessible(true);
+            return (String) method.invoke(search, board, length, rootMove);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("could not test TT PV filtering", e);
+        }
+    }
+
     private static void testCheckmatePrecedesFiftyMoveDraw() {
         Board board = board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1");
         SearchResult result = search(board, null);
@@ -298,6 +364,13 @@ public final class SearchCorrectnessTest {
             if (Move.toUci(move).equals(uci)) return move;
         }
         throw new AssertionError("No legal move " + uci + " in " + board.toFen());
+    }
+
+    private static boolean isLegalMove(Board board, int candidate) {
+        MoveList moves = new MoveList();
+        MoveGenerator.generateLegal(board, moves);
+        for (int i = 0; i < moves.size; i++) if (moves.get(i) == candidate) return true;
+        return false;
     }
 
     private static int quiescence(Board board, int ply) {

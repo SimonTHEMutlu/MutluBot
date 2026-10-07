@@ -25,6 +25,7 @@ public class UCIEngine {
     private final List<Long> gameHistory = new ArrayList<>();
 
     private Thread searchThread;
+    private volatile long searchGeneration;
 
     public static void main(String[] args) {
         new UCIEngine().run();
@@ -65,21 +66,21 @@ public class UCIEngine {
                 send("readyok");
                 break;
             case "ucinewgame":
-                stopSearchIfRunning();
+                stopSearchIfRunning(true);
                 tt.clear();
                 board.setStartPosition();
                 gameHistory.clear();
                 gameHistory.add(board.zobristKey);
                 break;
             case "position":
-                stopSearchIfRunning();
+                stopSearchIfRunning(true);
                 handlePosition(tokens);
                 break;
             case "go":
                 handleGo(tokens);
                 break;
             case "stop":
-                stopSearchIfRunning();
+                stopSearchIfRunning(false);
                 break;
             case "setoption":
                 handleSetOption(line);
@@ -100,7 +101,7 @@ public class UCIEngine {
                 }
                 break;
             case "quit":
-                stopSearchIfRunning();
+                stopSearchIfRunning(true);
                 return false;
             default:
                 // Unknown command: ignore, per typical UCI engine behavior.
@@ -175,7 +176,7 @@ public class UCIEngine {
     }
 
     private void handleGo(String[] tokens) {
-        stopSearchIfRunning();
+        stopSearchIfRunning(true);
 
         int depth = 0;
         long movetime = -1, wtime = -1, btime = -1, winc = 0, binc = 0;
@@ -230,11 +231,26 @@ public class UCIEngine {
         final int fDepthLimit = depthLimit;
         final long fSoftTimeBudget = softTimeBudget;
         final long fHardTimeBudget = hardTimeBudget;
+        final Board searchBoard = new Board();
+        searchBoard.setFromFen(board.toFen());
+        final Search searchForTask = search;
+        searchForTask.clearStopRequestForNextSearch();
+        final long[] searchHistory = historyArray;
+        final long taskGeneration = searchGeneration;
 
         searchThread = new Thread(() -> {
-            int best = search.search(board, fDepthLimit, fSoftTimeBudget,
-                    fHardTimeBudget, historyArray);
-            send("bestmove " + formatBestMove(best));
+            searchForTask.setInfoListener((infoDepth, selDepth, scoreCp, isMate, mateIn,
+                                           nodes, nps, timeMs, pv) -> {
+                if (taskGeneration == searchGeneration) {
+                    printInfo(infoDepth, selDepth, scoreCp, isMate, mateIn,
+                            nodes, nps, timeMs, pv);
+                }
+            });
+            int best = searchForTask.searchPrepared(searchBoard, fDepthLimit, fSoftTimeBudget,
+                    fHardTimeBudget, searchHistory);
+            if (taskGeneration == searchGeneration) {
+                send("bestmove " + formatBestMove(best));
+            }
         }, "search-thread");
         searchThread.start();
     }
@@ -243,17 +259,29 @@ public class UCIEngine {
         return move == Move.NONE ? "0000" : Move.toUci(move);
     }
 
-    private void stopSearchIfRunning() {
-        if (searchThread != null && searchThread.isAlive()) {
-            search.requestStop();
+    /**
+     * Stop and fully join an active search before mutating its board/search.
+     * Superseding commands invalidate its output; UCI stop preserves bestmove.
+     */
+    private void stopSearchIfRunning(boolean suppressBestMove) {
+        if (suppressBestMove) searchGeneration++;
+        Thread runningThread = searchThread;
+        if (runningThread == null || !runningThread.isAlive()) return;
+        search.requestStop();
+        boolean interrupted = false;
+        while (runningThread.isAlive()) {
             try {
-                searchThread.join(2000);
+                runningThread.join();
             } catch (InterruptedException ignored) {
+                interrupted = true;
             }
         }
+        if (searchThread == runningThread) searchThread = null;
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     private void handleSetOption(String line) {
+        stopSearchIfRunning(true);
         // Format: setoption name <id> [value <x>]
         String lower = line.toLowerCase();
         int nameIdx = lower.indexOf("name");
