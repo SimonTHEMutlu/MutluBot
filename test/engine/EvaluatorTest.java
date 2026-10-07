@@ -7,6 +7,10 @@ import static engine.Piece.WHITE;
 public final class EvaluatorTest {
     public static void main(String[] args) {
         testPassedPawnDetection();
+        testBackwardPawnDefinition();
+        testIsolatedPawnWeightsAndTaper();
+        testPawnStructureSymmetry();
+        testRookOpenAndSemiOpenFiles();
         testPassedPawnValues();
         testPassedPawnScoreIsApplied();
         testEndgameKingCentralization();
@@ -21,6 +25,8 @@ public final class EvaluatorTest {
         testOccupiedOuterZonePressureIsRetained();
         testQueenAbsenceReduction();
         testOpenAndSemiOpenKingFiles();
+        testThreatMetricsReportAndRestoreBoard();
+        testThreatMetricsPawnBreakAndKingFiles();
         testKingDangerCap();
         testKingDangerPhaseTaper();
         testIntactAndToleratedPawnShelter();
@@ -62,11 +68,21 @@ public final class EvaluatorTest {
     private static void testPassedPawnScoreIsApplied() {
         Board blockedEndgame = board("7k/5p2/3p4/2P5/8/8/5P2/K7 w - - 0 1");
         Board passedEndgame = board("7k/5p2/4p3/2P5/8/8/5P2/K7 w - - 0 1");
-        check(Evaluator.evaluate(passedEndgame) - Evaluator.evaluate(blockedEndgame) == 54, "endgame passer score is applied");
+        check(Evaluator.evaluate(passedEndgame) - Evaluator.evaluate(blockedEndgame)
+                        - (evaluatePawnStructureContribution(passedEndgame)
+                        - evaluatePawnStructureContribution(blockedEndgame))
+                        - (evaluateRookFileContribution(passedEndgame)
+                        - evaluateRookFileContribution(blockedEndgame)) == 54,
+                "endgame passer score is applied");
         Board blockedMiddlegame = board("nnbbrrqk/5p2/3p4/2P5/8/8/5P2/KQRRBBNN w - - 0 1");
         Board passedMiddlegame = board("nnbbrrqk/5p2/4p3/2P5/8/8/5P2/KQRRBBNN w - - 0 1");
         check(Evaluator.gamePhase(passedMiddlegame) == Evaluator.PHASE_MAX, "full middlegame phase");
-        check(evaluateWithoutActivity(passedMiddlegame) - evaluateWithoutActivity(blockedMiddlegame) == 25, "middlegame passer score is applied");
+        check(evaluateWithoutActivity(passedMiddlegame) - evaluateWithoutActivity(blockedMiddlegame)
+                        - (evaluatePawnStructureContribution(passedMiddlegame)
+                        - evaluatePawnStructureContribution(blockedMiddlegame))
+                        - (evaluateRookFileContribution(passedMiddlegame)
+                        - evaluateRookFileContribution(blockedMiddlegame)) == 25,
+                "middlegame passer score is applied");
     }
 
     private static void testEndgameKingCentralization() {
@@ -105,6 +121,145 @@ public final class EvaluatorTest {
         check(Evaluator.KING_ATTACK_UNIT[Piece.ROOK] == 3, "rook king attack unit is three");
         check(Evaluator.KING_ATTACK_UNIT[Piece.QUEEN] == 5, "queen king attack unit is five");
         check(Evaluator.KING_ATTACK_UNIT[Piece.KING] == 0, "king has no king attack unit");
+    }
+
+    private static void testBackwardPawnDefinition() {
+        Board backward = board("7k/8/2p5/pp6/3P4/2P5/8/K7 w - - 0 1");
+        check(Evaluator.isBackwardPawn(backward, WHITE, square("d4")),
+                "semi-open d4 pawn with blocked support and enemy-controlled d5 is backward");
+
+        Board enemySameFile = board("7k/3p4/2p5/1p6/3P4/2P5/8/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(enemySameFile, WHITE, square("d4")),
+                "an enemy pawn on the same file makes the file closed");
+        Board frontSafe = board("7k/8/8/1p6/3P4/2P5/8/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(frontSafe, WHITE, square("d4")),
+                "uncontrolled front square does not make a backward pawn");
+        Board potentialSupport = board("7k/8/2p5/8/3P4/2P5/8/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(potentialSupport, WHITE, square("d4")),
+                "adjacent pawn with a safe supporting advance prevents backward classification");
+        Board doublePushSupport = board("7k/8/2p5/8/3P4/8/2P5/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(doublePushSupport, WHITE, square("d4")),
+                "home-rank c2 pawn can double-push to support d4-d5");
+        Board blockedDoublePushTransit = board("7k/8/2p5/8/3P4/2N5/2P5/K7 w - - 0 1");
+        check(Evaluator.isBackwardPawn(blockedDoublePushTransit, WHITE, square("d4")),
+                "piece on the transit square prevents a two-push support plan");
+        Board blockedDoublePushDestination = board("7k/8/2p5/8/2NP4/8/2P5/K7 w - - 0 1");
+        check(Evaluator.isBackwardPawn(blockedDoublePushDestination, WHITE, square("d4")),
+                "piece on the double-push destination prevents a support plan");
+        Board isolated = board("7k/8/2p5/1p6/3P4/8/8/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(isolated, WHITE, square("d4")),
+                "isolated pawn is not double-classified as backward");
+        Board supportedAtSameRank = board("7k/8/2p5/8/2PP4/8/8/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(supportedAtSameRank, WHITE, square("d4")),
+                "adjacent pawn on the same rank supports the advance");
+        Board edgeSupport = board("7k/8/1p6/8/P7/8/8/K7 w - - 0 1");
+        check(!Evaluator.isBackwardPawn(edgeSupport, WHITE, square("a4")),
+                "edge-file pawn logic safely handles a single adjacent file");
+        check(((int) (Evaluator.pawnStructureTerms(backward) >> 32)) < 0,
+                "backward pawn term lowers its side's middlegame score");
+    }
+
+    private static void testIsolatedPawnWeightsAndTaper() {
+        Board flank = board("7k/8/8/8/P7/8/8/K7 w - - 0 1");
+        long flankTerms = Evaluator.pawnStructureTerms(flank);
+        check((int) (flankTerms >> 32) == -10 && (int) flankTerms == -16,
+                "isolated flank pawn uses documented MG/EG weights");
+
+        Board center = board("7k/8/8/8/3P4/8/8/K7 w - - 0 1");
+        long centerTerms = Evaluator.pawnStructureTerms(center);
+        check((int) (centerTerms >> 32) == -2 && (int) centerTerms == -12,
+                "isolated d-file pawn keeps central-pawn attacking potential");
+
+        Board game2Root = board("1r4k1/1p1r1pp1/p6p/q2p1bbQ/3BBN2/P3P1PP/1P3P2/2R2RK1 b - - 0 22");
+        Board bishopTakes = board("1r4k1/1p1r1pp1/p6p/q2p1bbQ/3BBN2/P3P1PP/1P3P2/2R2RK1 b - - 0 22");
+        Board pawnTakes = board("1r4k1/1p1r1pp1/p6p/q2p1bbQ/3BBN2/P3P1PP/1P3P2/2R2RK1 b - - 0 22");
+        play(bishopTakes, "f5e4");
+        play(pawnTakes, "d5e4");
+        int rootIsolatedMg = (int) (Evaluator.pawnStructureTerms(game2Root) >> 32);
+        int rootIsolatedEg = (int) Evaluator.pawnStructureTerms(game2Root);
+        int bishopCaptureIsolatedMg = (int) (Evaluator.pawnStructureTerms(bishopTakes) >> 32);
+        int bishopCaptureIsolatedEg = (int) Evaluator.pawnStructureTerms(bishopTakes);
+        int pawnCaptureIsolatedMg = (int) (Evaluator.pawnStructureTerms(pawnTakes) >> 32);
+        int pawnCaptureIsolatedEg = (int) Evaluator.pawnStructureTerms(pawnTakes);
+        check(rootIsolatedMg == bishopCaptureIsolatedMg && pawnCaptureIsolatedMg == bishopCaptureIsolatedMg - 2
+                        && rootIsolatedEg == bishopCaptureIsolatedEg
+                        && pawnCaptureIsolatedEg == bishopCaptureIsolatedEg - 12,
+                "Game 2 bishop capture retains the isolated d-pawn while d-pawn recapture resolves it");
+
+        Board edge = board("7k/8/8/8/7p/8/8/K7 b - - 0 1");
+        long edgeTerms = Evaluator.pawnStructureTerms(edge);
+        check((int) (edgeTerms >> 32) == 10 && (int) edgeTerms == 16,
+                "isolated h-file black pawn receives symmetric flank penalty");
+
+        Board centralFull = board("nnbbrrqk/8/8/8/3P4/8/8/KQRRBBNN w - - 0 1");
+        Board centralEndgame = center;
+        check(Evaluator.gamePhase(centralFull) == Evaluator.PHASE_MAX,
+                "central isolated pawn full-material reference");
+        check(Evaluator.gamePhase(centralEndgame) == 0,
+                "central isolated pawn ending has zero phase");
+        int full = evaluatePawnStructureContribution(centralFull);
+        int endgame = evaluatePawnStructureContribution(centralEndgame);
+        check(full == -2 && endgame == -12 && endgame < full,
+                "central IQP penalty grows as phase tapers into the endgame");
+
+        Board backward = board("7k/8/2p5/pp6/3P4/2P5/8/K7 w - - 0 1");
+        long backwardTerms = Evaluator.pawnStructureTerms(backward);
+        check((int) (backwardTerms >> 32) == -8 && (int) backwardTerms == -12,
+                "non-isolated backward pawn receives only its backward penalty");
+    }
+
+    private static void testPawnStructureSymmetry() {
+        Board whiteBackward = board("7k/8/2p5/pp6/3P4/2P5/8/K7 w - - 0 1");
+        Board blackBackward = board("k7/8/2p5/3p4/PP6/2P5/8/7K b - - 0 1");
+        long whiteTerms = Evaluator.pawnStructureTerms(whiteBackward);
+        long blackTerms = Evaluator.pawnStructureTerms(blackBackward);
+        check((int) (whiteTerms >> 32) == -(int) (blackTerms >> 32)
+                        && (int) whiteTerms == -(int) blackTerms,
+                "pawn-structure terms mirror by color");
+        check(Evaluator.evaluate(whiteBackward) == Evaluator.evaluate(blackBackward),
+                "evaluation is invariant under color/rank mirror with side to move mirrored");
+        Board sameWhitePositionBlackToMove = board("7k/8/2p5/pp6/3P4/2P5/8/K7 b - - 0 1");
+        check(Evaluator.evaluate(whiteBackward) == -Evaluator.evaluate(sameWhitePositionBlackToMove),
+                "pawn structure respects side-to-move perspective");
+
+        Board whiteTwoPushSupport = board("7k/8/2p5/8/3P4/8/2P5/K7 w - - 0 1");
+        Board blackTwoPushSupport = board("k7/2p5/8/3p4/8/2P5/8/7K b - - 0 1");
+        check(!Evaluator.isBackwardPawn(whiteTwoPushSupport, WHITE, square("d4"))
+                        && !Evaluator.isBackwardPawn(blackTwoPushSupport, BLACK, square("d5")),
+                "two-push support is recognized symmetrically for both colors");
+    }
+
+    private static void testRookOpenAndSemiOpenFiles() {
+        Board open = board("7k/8/8/8/R7/8/8/K7 w - - 0 1");
+        Board semiOpen = board("7k/p7/8/8/R7/8/8/K7 w - - 0 1");
+        Board closed = board("7k/p7/8/8/R7/8/P7/K7 w - - 0 1");
+        long openTerms = Evaluator.rookFileTerms(open);
+        long semiOpenTerms = Evaluator.rookFileTerms(semiOpen);
+        long closedTerms = Evaluator.rookFileTerms(closed);
+        check((int) (openTerms >> 32) == 16 && (int) openTerms == 12,
+                "rook on an open file receives the documented MG/EG bonus");
+        check((int) (semiOpenTerms >> 32) == 8 && (int) semiOpenTerms == 6,
+                "rook on a semi-open file receives the documented MG/EG bonus");
+        check(closedTerms == 0L, "a friendly pawn closes the rook's file for activity scoring");
+
+        Board blackOpen = board("k7/8/8/r7/8/8/8/7K b - - 0 1");
+        Board blackSemiOpen = board("k7/8/8/r7/8/8/P7/7K b - - 0 1");
+        long blackOpenTerms = Evaluator.rookFileTerms(blackOpen);
+        long blackSemiOpenTerms = Evaluator.rookFileTerms(blackSemiOpen);
+        check((int) (blackOpenTerms >> 32) == -(int) (openTerms >> 32)
+                        && (int) blackOpenTerms == -(int) openTerms
+                        && (int) (blackSemiOpenTerms >> 32) == -(int) (semiOpenTerms >> 32)
+                        && (int) blackSemiOpenTerms == -(int) semiOpenTerms,
+                "rook file activity mirrors symmetrically by color");
+
+        Board game2 = board("r2q1rk1/pp2bppp/8/3p1b2/N2Bn3/6PP/PP2PPB1/2RQ1RK1 b - - 0 15");
+        Board rac8 = board(game2.toFen());
+        play(rac8, "a8c8");
+        Board qa5 = board(game2.toFen());
+        play(qa5, "d8a5");
+        check((int) (Evaluator.rookFileTerms(rac8) >> 32)
+                        < (int) (Evaluator.rookFileTerms(qa5) >> 32),
+                "...Rac8 uses the open c-file more actively than ...Qa5");
     }
 
     private static void testKingDangerDevelopmentGate() {
@@ -164,6 +319,7 @@ public final class EvaluatorTest {
         Board two = board("6k1/8/7N/8/8/1B6/N1NN3/4K3 w - - 0 1");
         check(Evaluator.kingPressureMg(two, WHITE) > Evaluator.kingPressureMg(one, WHITE) + 4, "coordinated attackers escalate nonlinearly");
     }
+
 
     private static void testCentralQueenOuterRayIsIgnored() {
         Board afterD4D5 = board("rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 2");
@@ -278,6 +434,54 @@ public final class EvaluatorTest {
         check(evaluateShelterContribution(fullPhase) == -14, "full shelter penalty is applied");
     }
 
+    private static void testThreatMetricsReportAndRestoreBoard() {
+        Board board = board("4k3/8/8/8/8/8/8/Q6K w - - 0 1");
+        String originalFen = board.toFen();
+        long originalKey = board.zobristKey;
+        long metrics = Evaluator.threatMetrics(board, BLACK);
+        check(Evaluator.threatSafeCheckCount(metrics) > 0,
+                "diagnostic counts safe legal queen checks");
+        check(Evaluator.threatKingPressure(metrics) == Evaluator.kingPressureMg(board, WHITE),
+                "diagnostic reports the existing MG king-pressure signal");
+        check(board.toFen().equals(originalFen) && board.zobristKey == originalKey,
+                "diagnostic checking-move probes restore board state");
+
+        Board samePositionOtherTurn = board("4k3/8/8/8/8/8/8/Q6K b - - 0 1");
+        check(Evaluator.threatMetrics(samePositionOtherTurn, BLACK) == metrics,
+                "diagnostic is independent of current side to move");
+
+        Board hypotheticalEp = board("k3r3/3Pp3/8/8/8/8/8/4K3 w - d6 0 1");
+        Board noEp = board("k3r3/3Pp3/8/8/8/8/8/4K3 w - - 0 1");
+        String epFen = hypotheticalEp.toFen();
+        long epKey = hypotheticalEp.zobristKey;
+        check(Evaluator.threatMetrics(hypotheticalEp, WHITE)
+                        == Evaluator.threatMetrics(noEp, WHITE),
+                "a hypothetical attacker cannot inherit the real side's en-passant right");
+        check(hypotheticalEp.toFen().equals(epFen) && hypotheticalEp.zobristKey == epKey,
+                "hypothetical side scans restore en-passant state and hash");
+    }
+
+    private static void testThreatMetricsPawnBreakAndKingFiles() {
+        Board pawnBreak = board("k7/8/8/7p/8/8/8/6K1 b - - 0 1");
+        long pawnMetrics = Evaluator.threatMetrics(pawnBreak, WHITE);
+        check(Evaluator.threatPawnBreakCount(pawnMetrics) == 1,
+                "diagnostic counts a clear kingward pawn push in the adjacent file");
+
+        Board openFile = board("k5r1/8/8/8/8/8/8/6K1 b - - 0 1");
+        long openMetrics = Evaluator.threatMetrics(openFile, WHITE);
+        check(Evaluator.threatOpenKingFileCount(openMetrics) == 1,
+                "diagnostic counts an accessible open file beside the king");
+        check(Evaluator.threatSemiOpenKingFileCount(openMetrics) == 0,
+                "an open file is not also classified semi-open");
+
+        Board semiOpenFile = board("k6q/8/8/8/8/8/7P/6K1 b - - 0 1");
+        long semiOpenMetrics = Evaluator.threatMetrics(semiOpenFile, WHITE);
+        check(Evaluator.threatSemiOpenKingFileCount(semiOpenMetrics) == 1,
+                "diagnostic counts an accessible semi-open file beside the king");
+        check(Evaluator.threatOpenKingFileCount(semiOpenMetrics) == 0,
+                "a defended-pawn file is not classified open");
+    }
+
     private static void testQueenPresentForwardCover() {
         Board noQueen = board("7k/8/8/8/8/8/8/6K1 w - - 0 1");
         Board queenAndNoCover = board("q6k/8/8/8/8/8/8/6K1 w - - 0 1");
@@ -330,6 +534,19 @@ public final class EvaluatorTest {
         return Bitboards.squareFromName(name);
     }
 
+    private static void play(Board board, String uci) {
+        MoveList legal = new MoveList();
+        MoveGenerator.generateLegal(board, legal);
+        for (int i = 0; i < legal.size; i++) {
+            int move = legal.get(i);
+            if (Move.toUci(move).equals(uci)) {
+                board.makeMove(move);
+                return;
+            }
+        }
+        throw new AssertionError("illegal move " + uci + " in " + board.toFen());
+    }
+
     private static int evaluateWithoutActivity(Board board) {
         int phase = Evaluator.gamePhase(board);
         long terms = Evaluator.activityTerms(board);
@@ -345,6 +562,22 @@ public final class EvaluatorTest {
     private static int evaluateShelterContribution(Board board) {
         int rawWhiteRelative = Evaluator.kingShelterPenaltyMg(board, BLACK) - Evaluator.kingShelterPenaltyMg(board, WHITE);
         int tapered = rawWhiteRelative * Evaluator.gamePhase(board) / Evaluator.PHASE_MAX;
+        return board.sideToMove == WHITE ? tapered : -tapered;
+    }
+
+    private static int evaluatePawnStructureContribution(Board board) {
+        long terms = Evaluator.pawnStructureTerms(board);
+        int phase = Evaluator.gamePhase(board);
+        int tapered = ((int) (terms >> 32) * phase + (int) terms * (Evaluator.PHASE_MAX - phase))
+                / Evaluator.PHASE_MAX;
+        return board.sideToMove == WHITE ? tapered : -tapered;
+    }
+
+    private static int evaluateRookFileContribution(Board board) {
+        long terms = Evaluator.rookFileTerms(board);
+        int phase = Evaluator.gamePhase(board);
+        int tapered = ((int) (terms >> 32) * phase + (int) terms * (Evaluator.PHASE_MAX - phase))
+                / Evaluator.PHASE_MAX;
         return board.sideToMove == WHITE ? tapered : -tapered;
     }
 

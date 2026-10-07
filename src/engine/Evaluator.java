@@ -7,12 +7,11 @@ import static engine.Bitboards.*;
 
 /**
  * A deliberately simple tapered evaluation function: material, piece-square
- * tables, bishop pair, passed pawns, endgame king activity, and a bounded
- * middlegame king-danger term. Good next steps:
- *   - More pawn structure (isolated/doubled pawns, pawn chains)
+ * tables, bishop pair, pawn structure and passers, rook-file activity, endgame
+ * king activity, and a bounded middlegame king-danger term. Good next steps:
  *   - Broader king safety (pawn shield, open files near king, attacker counts)
  *   - Broader mobility, if it can meet the evaluator performance budget
- *   - Rook on open file / 7th rank, knight outposts, etc.
+ *   - Rook on the 7th rank, knight outposts, etc.
  */
 public final class Evaluator {
     private Evaluator() {}
@@ -46,6 +45,13 @@ public final class Evaluator {
     // to the endgame score and therefore fades out as non-pawn material returns.
     static final int ENEMY_PAWN_KING_PROXIMITY = 2;
     private static final long[][] PASSED_PAWN_MASK = new long[2][64];
+    private static final long[] ADJACENT_FILE_MASK = new long[8];
+
+    // Rooks gain modest tapered activity for working on pawn-free files.
+    private static final int ROOK_OPEN_FILE_MG = 16;
+    private static final int ROOK_OPEN_FILE_EG = 12;
+    private static final int ROOK_SEMIOPEN_FILE_MG = 8;
+    private static final int ROOK_SEMIOPEN_FILE_EG = 6;
 
     // Mobility is deliberately disabled in this isolated king-safety pass. The
     // attack maps below are used only for king danger, avoiding a second set of
@@ -79,6 +85,22 @@ public final class Evaluator {
     // Missing forward cover costs a small amount per neighboring king file
     // while the opposing queen is present. It fades with the normal MG phase.
     private static final int QUEEN_PRESENT_MISSING_COVER_MG = 6;
+
+    // Pawn structure is deliberately modest. A non-central isolated pawn costs
+    // 10 MG / 16 EG; an isolated c/f pawn costs 5 / 14, while d/e IQPs cost
+    // only 2 MG / 12 EG. The central MG relief preserves attacking chances
+    // while pieces remain, and the normal phase blend makes IQPs more costly
+    // as material comes off. A true backward pawn on a semi-open file costs
+    // 8 MG / 12 EG. Isolated pawns are excluded from this term to avoid stacking
+    // two labels on the same pawn.
+    private static final int ISOLATED_FLANK_MG = 10;
+    private static final int ISOLATED_FLANK_EG = 16;
+    private static final int ISOLATED_WING_MG = 5;
+    private static final int ISOLATED_WING_EG = 14;
+    private static final int ISOLATED_CENTER_MG = 2;
+    private static final int ISOLATED_CENTER_EG = 12;
+    private static final int BACKWARD_SEMIOPEN_MG = 8;
+    private static final int BACKWARD_SEMIOPEN_EG = 12;
 
     // Tables below are given in "a8..h8, a7..h7, ... a1..h1" reading order
     // (top of a printed board down to the bottom) and converted to our
@@ -240,6 +262,11 @@ static {
         }
     }
 
+    for (int file = 0; file < 8; file++) {
+        if (file > 0) ADJACENT_FILE_MASK[file] |= FILE_MASK[file - 1];
+        if (file < 7) ADJACENT_FILE_MASK[file] |= FILE_MASK[file + 1];
+    }
+
     // A pawn is passed when no enemy pawn is ahead of it on its own file or
     // either adjacent file. Precompute those three-file forward spans so the
     // evaluator only needs one bitboard intersection per pawn.
@@ -322,6 +349,14 @@ static {
     if (popcount(b.pieceBB[WHITE][BISHOP]) >= 2) { mgScore += 30; egScore += 30; }
     if (popcount(b.pieceBB[BLACK][BISHOP]) >= 2) { mgScore -= 30; egScore -= 30; }
 
+    long pawnStructure = pawnStructureTerms(b);
+    mgScore += (int) (pawnStructure >> 32);
+    egScore += (int) pawnStructure;
+
+    long rookFiles = rookFileTerms(b);
+    mgScore += (int) (rookFiles >> 32);
+    egScore += (int) rookFiles;
+
     int phase = gamePhase(b);
     if (phase != 0) {
         mgScore += kingShelterPenaltyMg(b, BLACK) - kingShelterPenaltyMg(b, WHITE);
@@ -333,6 +368,124 @@ static {
     int blended = (mgScore * phase + egScore * (PHASE_MAX - phase)) / PHASE_MAX;
 
     return b.sideToMove == WHITE ? blended : -blended;
+    }
+
+    /** Returns white-relative pawn structure packed as signed MG/EG scores. */
+    static long pawnStructureTerms(Board b) {
+        long white = pawnStructureForSide(b, WHITE);
+        long black = pawnStructureForSide(b, BLACK);
+        int mg = (int) (white >> 32) - (int) (black >> 32);
+        int eg = (int) white - (int) black;
+        return ((long) mg << 32) | (eg & 0xffffffffL);
+    }
+
+    /** Returns white-relative tapered activity for rooks on open/semi-open files. */
+    static long rookFileTerms(Board b) {
+        int mg = 0;
+        int eg = 0;
+        for (int color = WHITE; color <= BLACK; color++) {
+            long ownPawns = b.pieceBB[color][PAWN];
+            long enemyPawns = b.pieceBB[opposite(color)][PAWN];
+            long rooks = b.pieceBB[color][ROOK];
+            int sign = color == WHITE ? 1 : -1;
+            while (rooks != 0L) {
+                int square = lsb(rooks);
+                rooks &= rooks - 1;
+                long file = FILE_MASK[square & 7];
+                if ((ownPawns & file) != 0L) continue;
+                boolean open = (enemyPawns & file) == 0L;
+                mg += sign * (open ? ROOK_OPEN_FILE_MG : ROOK_SEMIOPEN_FILE_MG);
+                eg += sign * (open ? ROOK_OPEN_FILE_EG : ROOK_SEMIOPEN_FILE_EG);
+            }
+        }
+        return ((long) mg << 32) | (eg & 0xffffffffL);
+    }
+
+    /** Returns one side's signed pawn-structure score packed as MG/EG. */
+    private static long pawnStructureForSide(Board b, int color) {
+        int mg = 0;
+        int eg = 0;
+        long pawns = b.pieceBB[color][PAWN];
+        long friendly = pawns;
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int file = sq & 7;
+            long adjacentFiles = ADJACENT_FILE_MASK[file];
+            if ((friendly & adjacentFiles) == 0L) {
+                mg -= (file == 3 || file == 4) ? ISOLATED_CENTER_MG
+                        : (file == 2 || file == 5) ? ISOLATED_WING_MG : ISOLATED_FLANK_MG;
+                eg -= (file == 3 || file == 4) ? ISOLATED_CENTER_EG
+                        : (file == 2 || file == 5) ? ISOLATED_WING_EG : ISOLATED_FLANK_EG;
+            } else if (isBackwardPawn(b, color, sq)) {
+                mg -= BACKWARD_SEMIOPEN_MG;
+                eg -= BACKWARD_SEMIOPEN_EG;
+            }
+        }
+        return ((long) mg << 32) | (eg & 0xffffffffL);
+    }
+
+    /**
+     * True for a non-isolated pawn on a file with no enemy pawn, when it has
+     * no adjacent pawn able to support its advance and an enemy pawn controls
+     * the square immediately ahead. A neighboring pawn one rank behind only
+     * counts as potential support when its advance square is clear and not
+     * controlled by an enemy pawn. A home-rank pawn two ranks behind can also
+     * catch up with a legal two-square push when both path squares are clear.
+     */
+    static boolean isBackwardPawn(Board b, int color, int sq) {
+        long friendly = b.pieceBB[color][PAWN];
+        long enemy = b.pieceBB[opposite(color)][PAWN];
+        int file = sq & 7;
+        int rank = sq >>> 3;
+        if ((enemy & FILE_MASK[file]) != 0L) return false;
+        long neighbors = friendly & ADJACENT_FILE_MASK[file];
+        if (neighbors == 0L) return false;
+        int step = color == WHITE ? 8 : -8;
+        int front = sq + step;
+        if (front < 0 || front >= 64) return false;
+        if ((enemy & PAWN_ATTACKS[color][front]) == 0L) return false;
+        return !hasPotentialAdjacentPawnSupport(b, color, rank, step, neighbors, enemy);
+    }
+
+    private static boolean hasPotentialAdjacentPawnSupport(Board b, int color, int rank,
+                                                            int step, long neighbors, long enemy) {
+        while (neighbors != 0L) {
+            int neighbor = lsb(neighbors);
+            neighbors &= neighbors - 1;
+            int neighborRank = neighbor >>> 3;
+            if (neighborRank == rank) return true;
+            if ((color == WHITE && neighborRank == rank - 1)
+                    || (color == BLACK && neighborRank == rank + 1)) {
+                if (isClearSafePawnSupport(b, color, neighbor + step, enemy)) return true;
+            }
+            int homeRank = color == WHITE ? 1 : 6;
+            if (neighborRank == homeRank
+                    && ((color == WHITE && rank == homeRank + 2)
+                    || (color == BLACK && rank == homeRank - 2))) {
+                int transitSquare = neighbor + step;
+                int supportSquare = transitSquare + step;
+                if (isClearSafeDoublePush(b, color, transitSquare, supportSquare, enemy)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isClearSafePawnSupport(Board b, int color, int supportSquare, long enemy) {
+        if (supportSquare < 0 || supportSquare >= 64) return false;
+        long bit = 1L << supportSquare;
+        return (b.allOccupancy & bit) == 0L
+                && (enemy & PAWN_ATTACKS[color][supportSquare]) == 0L;
+    }
+
+    private static boolean isClearSafeDoublePush(Board b, int color, int transitSquare,
+                                                  int supportSquare, long enemy) {
+        if (transitSquare < 0 || transitSquare >= 64 || supportSquare < 0 || supportSquare >= 64) return false;
+        long path = (1L << transitSquare) | (1L << supportSquare);
+        return (b.allOccupancy & path) == 0L
+                && (enemy & PAWN_ATTACKS[color][supportSquare]) == 0L;
     }
 
     /** Package-private for focused evaluator tests. */
@@ -358,6 +511,198 @@ static {
     /** Package-private reference calculation used by focused evaluator tests. */
     static int kingPressureMg(Board b, int attackingColor) {
         return kingDangerMg(b, attackingColor);
+    }
+
+    /**
+     * Returns a diagnostic summary of threats against {@code defendingColor}.
+     * This is deliberately not part of normal evaluation. The packed fields are
+     * safe checking moves (bits 0-7), current tapered king pressure in MG cp
+     * (8-15), plausible pawn breaks toward the king (16-23), accessible open
+     * king-adjacent files (24-27), and accessible semi-open files (28-31).
+     *
+     * Safe checks are legal checking moves whose destination is not geometrically
+     * attacked by the defender after the move. This conservative test can miss
+     * checks where a nominal defender is pinned. Castling checks are omitted.
+     * The method uses only primitive locals and temporarily makes/unmakes moves;
+     * it allocates no per-call objects and restores the complete visible board
+     * state before returning.
+     */
+    static long threatMetrics(Board b, int defendingColor) {
+        int attackingColor = opposite(defendingColor);
+        int safeChecks = countSafeCheckingMoves(b, attackingColor, defendingColor);
+        int pressure = kingPressureMg(b, attackingColor);
+        int pawnBreaks = countKingwardPawnBreaks(b, attackingColor, defendingColor);
+        int openFiles = accessibleKingFiles(b, attackingColor, defendingColor, true);
+        int semiOpenFiles = accessibleKingFiles(b, attackingColor, defendingColor, false);
+        return ((long) Math.min(255, safeChecks))
+                | ((long) Math.min(255, pressure) << 8)
+                | ((long) Math.min(255, pawnBreaks) << 16)
+                | ((long) Math.min(15, openFiles) << 24)
+                | ((long) Math.min(15, semiOpenFiles) << 28);
+    }
+
+    static int threatSafeCheckCount(long metrics) { return (int) (metrics & 0xffL); }
+    static int threatKingPressure(long metrics) { return (int) ((metrics >>> 8) & 0xffL); }
+    static int threatPawnBreakCount(long metrics) { return (int) ((metrics >>> 16) & 0xffL); }
+    static int threatOpenKingFileCount(long metrics) { return (int) ((metrics >>> 24) & 0xfL); }
+    static int threatSemiOpenKingFileCount(long metrics) { return (int) ((metrics >>> 28) & 0xfL); }
+
+    private static int countSafeCheckingMoves(Board b, int attackingColor, int defendingColor) {
+        int originalSide = b.sideToMove;
+        int originalEpSquare = b.epSquare;
+        long originalKey = b.zobristKey;
+        if (originalSide != attackingColor) {
+            // En-passant belongs only to the actual side to move. A diagnostic
+            // side flip must not let the hypothetical attacker inherit it.
+            if (b.epSquare != -1) {
+                b.zobristKey ^= Zobrist.EP_FILE_KEY[b.epSquare & 7];
+                b.epSquare = -1;
+            }
+            b.sideToMove = attackingColor;
+            b.zobristKey ^= Zobrist.SIDE_KEY;
+        }
+
+        int count = 0;
+        long own = b.occupancy[attackingColor];
+        long enemy = b.occupancy[defendingColor] & ~b.pieceBB[defendingColor][KING];
+        for (int type = KNIGHT; type <= KING; type++) {
+            long pieces = b.pieceBB[attackingColor][type];
+            while (pieces != 0L) {
+                int from = lsb(pieces);
+                pieces &= pieces - 1;
+                long targets = pieceAttacks(type, from, b.allOccupancy) & ~own
+                        & ~b.pieceBB[defendingColor][KING];
+                while (targets != 0L) {
+                    int to = lsb(targets);
+                    targets &= targets - 1;
+                    int flag = (enemy & (1L << to)) != 0L ? Move.CAPTURE : Move.QUIET;
+                    if (isSafeCheckingMove(b, Move.encode(from, to, flag), to, attackingColor, defendingColor)) {
+                        count++;
+                    }
+                }
+            }
+        }
+
+        count += countSafePawnChecks(b, attackingColor, defendingColor, enemy);
+        b.sideToMove = originalSide;
+        b.epSquare = originalEpSquare;
+        b.zobristKey = originalKey;
+        return count;
+    }
+
+    private static int countSafePawnChecks(Board b, int attackingColor, int defendingColor, long enemy) {
+        int count = 0;
+        int forward = attackingColor == WHITE ? 8 : -8;
+        int promotionRank = attackingColor == WHITE ? 7 : 0;
+        long pawns = b.pieceBB[attackingColor][PAWN];
+        while (pawns != 0L) {
+            int from = lsb(pawns);
+            pawns &= pawns - 1;
+            int one = from + forward;
+            if (one >= 0 && one < 64 && (b.allOccupancy & (1L << one)) == 0L) {
+                if ((one >>> 3) == promotionRank) {
+                    if (safePromotionCheck(b, from, one, attackingColor, defendingColor, false)) count++;
+                } else {
+                    if (isSafeCheckingMove(b, Move.encode(from, one, Move.QUIET), one,
+                            attackingColor, defendingColor)) count++;
+                    int startRank = attackingColor == WHITE ? 1 : 6;
+                    int two = from + 2 * forward;
+                    if ((from >>> 3) == startRank && (b.allOccupancy & (1L << two)) == 0L
+                            && isSafeCheckingMove(b, Move.encode(from, two, Move.DOUBLE_PAWN_PUSH), two,
+                            attackingColor, defendingColor)) count++;
+                }
+            }
+
+            long captures = PAWN_ATTACKS[attackingColor][from] & enemy
+                    & ~b.pieceBB[defendingColor][KING];
+            while (captures != 0L) {
+                int to = lsb(captures);
+                captures &= captures - 1;
+                if ((to >>> 3) == promotionRank) {
+                    if (safePromotionCheck(b, from, to, attackingColor, defendingColor, true)) count++;
+                } else if (isSafeCheckingMove(b, Move.encode(from, to, Move.CAPTURE), to,
+                        attackingColor, defendingColor)) {
+                    count++;
+                }
+            }
+
+            if (b.epSquare >= 0 && (PAWN_ATTACKS[attackingColor][from] & (1L << b.epSquare)) != 0L
+                    && isSafeCheckingMove(b, Move.encode(from, b.epSquare, Move.EP_CAPTURE), b.epSquare,
+                    attackingColor, defendingColor)) count++;
+        }
+        return count;
+    }
+
+    private static boolean safePromotionCheck(Board b, int from, int to, int attackingColor,
+                                               int defendingColor, boolean capture) {
+        int flagBase = capture ? Move.KNIGHT_PROMO_CAPTURE : Move.KNIGHT_PROMO;
+        for (int piece = KNIGHT; piece <= QUEEN; piece++) {
+            int flag = flagBase + (piece - KNIGHT);
+            if (isSafeCheckingMove(b, Move.encode(from, to, flag), to, attackingColor, defendingColor)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isSafeCheckingMove(Board b, int move, int to,
+                                               int attackingColor, int defendingColor) {
+        b.makeMove(move);
+        boolean safeCheck = !b.isInCheck(attackingColor)
+                && b.isInCheck(defendingColor)
+                && !b.isSquareAttacked(to, defendingColor);
+        b.unmakeMove();
+        return safeCheck;
+    }
+
+    private static int countKingwardPawnBreaks(Board b, int attackingColor, int defendingColor) {
+        int king = b.kingSquare(defendingColor);
+        int kingFile = king & 7;
+        int forward = attackingColor == WHITE ? 8 : -8;
+        int startRank = attackingColor == WHITE ? 1 : 6;
+        int count = 0;
+        long pawns = b.pieceBB[attackingColor][PAWN];
+        long enemy = b.occupancy[defendingColor];
+        while (pawns != 0L) {
+            int from = lsb(pawns);
+            pawns &= pawns - 1;
+            int fromDistance = chebyshevDistance(from, king);
+            int one = from + forward;
+            if (one >= 0 && one < 64 && (b.allOccupancy & (1L << one)) == 0L
+                    && Math.abs((one & 7) - kingFile) <= 1
+                    && chebyshevDistance(one, king) < fromDistance) {
+                count++;
+                int two = from + 2 * forward;
+                if ((from >>> 3) == startRank && (b.allOccupancy & (1L << two)) == 0L
+                        && Math.abs((two & 7) - kingFile) <= 1
+                        && chebyshevDistance(two, king) < fromDistance) count++;
+            }
+            long captures = PAWN_ATTACKS[attackingColor][from] & enemy;
+            while (captures != 0L) {
+                int to = lsb(captures);
+                captures &= captures - 1;
+                if (Math.abs((to & 7) - kingFile) <= 1
+                        && chebyshevDistance(to, king) < fromDistance) count++;
+            }
+        }
+        return count;
+    }
+
+    private static int chebyshevDistance(int a, int b) {
+        return Math.max(Math.abs((a & 7) - (b & 7)), Math.abs((a >>> 3) - (b >>> 3)));
+    }
+
+    private static int accessibleKingFiles(Board b, int attackingColor, int defendingColor, boolean open) {
+        int kingFile = b.kingSquare(defendingColor) & 7;
+        long heavyPieces = b.pieceBB[attackingColor][ROOK] | b.pieceBB[attackingColor][QUEEN];
+        long attackingPawns = b.pieceBB[attackingColor][PAWN];
+        long defendingPawns = b.pieceBB[defendingColor][PAWN];
+        int count = 0;
+        for (int file = Math.max(0, kingFile - 1); file <= Math.min(7, kingFile + 1); file++) {
+            long mask = FILE_MASK[file];
+            if ((heavyPieces & mask) == 0L || (attackingPawns & mask) != 0L) continue;
+            boolean isOpen = (defendingPawns & mask) == 0L;
+            if (isOpen == open) count++;
+        }
+        return count;
     }
 
     private static int kingDangerMg(Board b, int attackingColor) {
@@ -570,6 +915,7 @@ static {
             case BISHOP: return bishopAttacks(sq, occupancy);
             case ROOK: return rookAttacks(sq, occupancy);
             case QUEEN: return queenAttacks(sq, occupancy);
+            case KING: return KING_ATTACKS[sq];
             default: return 0L;
         }
     }
