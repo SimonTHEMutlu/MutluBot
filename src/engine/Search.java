@@ -154,6 +154,7 @@ public class Search {
     private long deadlineNanos;
     private long softTimeNanos;
     private boolean timeLimited;
+    private boolean rootDrawClaimed;
 
     private int rootBestMove;
     private int iterationBestMove;
@@ -494,6 +495,7 @@ public class Search {
         int depthLimit = maxDepth > 0 ? maxDepth : MAX_PLY - 4;
         rootBestMove = Move.NONE;
         iterationBestMove = Move.NONE;
+        rootDrawClaimed = false;
         MoveList rootMoves = new MoveList();
         MoveGenerator.generateLegal(board, rootMoves);
         if (rootMoves.size <= 1) {
@@ -513,6 +515,7 @@ public class Search {
         int stableIterations = 0;
         int previousBestMove = Move.NONE;
         int previousScore = 0;
+        int lastCompletedBestMove = Move.NONE;
 
         for (int depth = 1; depth <= depthLimit; depth++) {
             long now = System.nanoTime();
@@ -563,8 +566,22 @@ public class Search {
                 break; // incomplete iteration; keep the previous depth's result
             }
 
+            // Commit an iteration only when its score is paired with a legal
+            // root move. A bound-only aspiration retry must never replace the
+            // last trustworthy bestmove.
+            if (iterationBestMove == Move.NONE
+                    || !isLegalInPosition(board, iterationBestMove)) {
+                if (rootDrawClaimed) {
+                    bestScore = score;
+                    long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+                    if (listener != null) reportInfo(board, depth, bestScore, elapsedMs);
+                }
+                break;
+            }
+
             bestScore = score;
-            if (iterationBestMove != Move.NONE) rootBestMove = iterationBestMove;
+            lastCompletedBestMove = iterationBestMove;
+            rootBestMove = lastCompletedBestMove;
             if (rootBestMove == previousBestMove && Math.abs(bestScore - previousScore) <= 35) {
                 stableIterations++;
             } else {
@@ -589,6 +606,7 @@ public class Search {
             if (Math.abs(bestScore) >= MATE_SCORE - MAX_PLY) break; // forced mate found
         }
 
+        rootBestMove = lastCompletedBestMove;
         if (rootBestMove == Move.NONE) {
             MoveList legal = new MoveList();
             MoveGenerator.generateLegal(board, legal);
@@ -713,6 +731,7 @@ public class Search {
         if (board.halfmoveClock >= 100) {
             boolean checked = board.isInCheck(board.sideToMove);
             if (!checked || MoveGenerator.hasLegalMove(board)) {
+                if (searchPly == 0) rootDrawClaimed = true;
                 if (instrumentationEnabled) fiftyMoveExits++;
                 return 0;
             }
@@ -724,6 +743,7 @@ public class Search {
                 repetitions++;
                 repetitionTainted[searchPly] = true;
                 if (isRepetitionDraw(repetitions, searchPly)) {
+                    if (searchPly == 0) rootDrawClaimed = true;
                     if (instrumentationEnabled) repetitionExits++;
                     return 0;
                 }

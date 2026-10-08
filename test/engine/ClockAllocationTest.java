@@ -5,6 +5,7 @@ public final class ClockAllocationTest {
     public static void main(String[] args) {
         testThirtyMinutesPlusThreeSeconds();
         testOpeningAndLaterGameBudgets();
+        testNoIncrementLongGameBudget();
         testMoveTimeUsesRequestedBudget();
         testLowAndInvalidClockInputs();
         testHardDeadlineReturnsLegalMove();
@@ -36,6 +37,18 @@ public final class ClockAllocationTest {
         ClockAllocation.Budget explicitMtg = ClockAllocation.forClock(25, 300_000, 0, 10);
         check(explicitMtg.softMs == 30_000,
                 "explicit moves-to-go should replace the default estimate: " + explicitMtg.softMs);
+    }
+
+    private static void testNoIncrementLongGameBudget() {
+        ClockAllocation.Budget opening = ClockAllocation.forClock(5, 1_680_000, 0, 0);
+        check(opening.softMs == 45_360 && opening.hardMs == 68_040,
+                "30+0 must preserve a 50-move opening horizon: "
+                        + opening.softMs + "/" + opening.hardMs);
+
+        ClockAllocation.Budget ending = ClockAllocation.forClock(96, 36_239, 0, 0);
+        check(ending.softMs == 604 && ending.hardMs == 906,
+                "late 30+0 ending must preserve a 60-move horizon: "
+                        + ending.softMs + "/" + ending.hardMs);
     }
 
     private static void testMoveTimeUsesRequestedBudget() {

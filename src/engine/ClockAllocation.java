@@ -3,6 +3,8 @@ package engine;
 /** UCI clock allocation in milliseconds. Kept separate from parsing for direct tests. */
 final class ClockAllocation {
     private static final int DEFAULT_MOVES_TO_GO = 30;
+    private static final int NO_INCREMENT_MOVES_TO_GO = 50;
+    private static final int NO_INCREMENT_ENDGAME_MOVES_TO_GO = 60;
     private static final double INCREMENT_WEIGHT = 0.8;
     private static final double OPENING_MULTIPLIER = 1.35;
     private static final double EARLY_GAME_MULTIPLIER = 1.15;
@@ -32,7 +34,8 @@ final class ClockAllocation {
                            int movesToGo) {
         if (myTimeMs < 0) myTimeMs = 5000;
         long increment = Math.max(0, myIncrementMs);
-        int mtg = movesToGo > 0 ? movesToGo : DEFAULT_MOVES_TO_GO;
+        int mtg = movesToGo > 0 ? movesToGo
+                : estimatedMovesToGo(fullmoveNumber, increment);
 
         double base = (double) myTimeMs / mtg + increment * INCREMENT_WEIGHT;
         double phaseMultiplier = fullmoveNumber <= 10 ? OPENING_MULTIPLIER
@@ -46,6 +49,16 @@ final class ClockAllocation {
         long hard = Math.min(available, toMillis(soft * HARD_BUDGET_MULTIPLIER));
         soft = Math.max(1, Math.min(soft, hard));
         return new Budget(soft, hard);
+    }
+
+    private static int estimatedMovesToGo(int fullmoveNumber, long incrementMs) {
+        if (incrementMs > 0) return DEFAULT_MOVES_TO_GO;
+        // Sudden-death games need a longer horizon than the old fixed
+        // 30-move assumption. Long rook endings routinely continue past move
+        // 100, so become still more conservative once the game is mature.
+        return fullmoveNumber >= 50
+                ? NO_INCREMENT_ENDGAME_MOVES_TO_GO
+                : NO_INCREMENT_MOVES_TO_GO;
     }
 
     private static long toMillis(double value) {
