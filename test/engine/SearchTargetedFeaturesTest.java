@@ -1,5 +1,8 @@
 package engine;
 
+import java.util.HashMap;
+import java.util.Map;
+
 /** Regressions for the root forced-move shortcut and bounded pawn-offer LMR guard. */
 public final class SearchTargetedFeaturesTest {
     public static void main(String[] args) {
@@ -8,6 +11,7 @@ public final class SearchTargetedFeaturesTest {
         testReusedSearchResetsTerminalSelectiveDepth();
         testQueenGambitOfferGuard();
         testUnsoundPawnOfferIsNotChosen();
+        testOpeningBishopPreferenceChangesOnlyTheRootChoice();
         testUciNoMoveFormatting();
         System.out.println("SearchTargetedFeaturesTest passed");
     }
@@ -103,6 +107,45 @@ public final class SearchTargetedFeaturesTest {
         check(best != offer,
                 "full-depth verification must reject an unrecapturable pawn hang");
         check(isLegal(board, best), "search must return a legal alternative to the pawn hang");
+    }
+
+    private static void testOpeningBishopPreferenceChangesOnlyTheRootChoice() {
+        Board board = board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 3 3");
+        String before = board.toFen();
+        final int[] reportedScore = {Integer.MIN_VALUE};
+        final Map<String, int[]> bishopCandidates = new HashMap<String, int[]>();
+        Search search = new Search(new TranspositionTable(1));
+        search.setInfoListener((depth, selDepth, score, mate, mateIn, nodes, nps, timeMs, pv) -> {
+            if (depth == 8) reportedScore[0] = score;
+        });
+        search.setRootCandidateListener((depth, rank, move, score, exact, nodes, pv) -> {
+            if (depth == 8 && move.startsWith("f1")) {
+                bishopCandidates.put(move, new int[] {score, exact ? 1 : 0});
+            }
+        });
+
+        int best = search.search(board, 8, -1, null);
+        check(isLegal(board, best), "opening bishop preference must return a legal root move");
+        check(Move.toUci(best).startsWith("f1"),
+                "a bishop move should win this close Italian root comparison instead of entering Four Knights");
+        check(before.equals(board.toFen()), "opening bishop preference must preserve the root board");
+        check(reportedScore[0] != Integer.MIN_VALUE,
+                "the completed root iteration must report its ordinary centipawn score");
+        int[] selectedCandidate = bishopCandidates.get(Move.toUci(best));
+        check(selectedCandidate != null && selectedCandidate[1] == 1,
+                "a bishop selected by its preference must have a full-depth root score");
+        check(reportedScore[0] == selectedCandidate[0],
+                "the one-move preference must not be added to the reported UCI centipawn score");
+
+        board.makeMove(best);
+        MoveList replies = new MoveList();
+        MoveGenerator.generateLegal(board, replies);
+        for (int i = 0; i < replies.size; i++) {
+            check(Evaluator.openingBishopDevelopmentBonus(board, replies.get(i)) == 0,
+                    "after the bishop develops, the temporary preference must disappear");
+        }
+        board.unmakeMove();
+        check(before.equals(board.toFen()), "one-turn preference test must restore the board");
     }
 
     private static void testUciNoMoveFormatting() {

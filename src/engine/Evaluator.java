@@ -23,6 +23,11 @@ public final class Evaluator {
     public static final int QUEEN_VALUE = 900;
     public static final int[] PIECE_VALUE = {PAWN_VALUE, KNIGHT_VALUE, BISHOP_VALUE, ROOK_VALUE, QUEEN_VALUE, 0};
 
+    // A small, one-ply opening preference for developing a bishop after both
+    // sides have developed one knight. Search applies this only to the root
+    // candidate score so it cannot become a persistent positional bonus.
+    private static final int OPENING_BISHOP_DEVELOPMENT_BONUS = 8;
+
     public static final int MATE_SCORE = 30000;
     public static final int INFINITY_SCORE = 32000;
 
@@ -110,9 +115,9 @@ public final class Evaluator {
             50, 50,  50,  50,  50,  50, 50, 50,
             10, 10,  20,  30,  30,  20, 10, 10,
              5,  5,  10,  25,  25,  10,  5,  5,
-             0,  0,   15,  25,  20,   0,  0,  0,
-             5, 5, 10,   0,   0, -10, 5,  5,
-             5, 10,  -5, -20, -20,  10, 10,  5,
+             0,  0,   15,  20,  20,   5,  0,  0,
+             5, 5, 10,   5,   5, -10, 5,  5,
+            5, 10,  -5,  -5,  -5,  10, 10,  5,
              0,  0,   0,   0,   0,   0,  0,  0
     };
 
@@ -151,14 +156,14 @@ public final class Evaluator {
     };
 
     private static final int[] BISHOP_TABLE_RAW = {
-            -20, -10, -10, -10, -10, -10, -10, -20,
-            -10,   0,   0,   0,   0,   0,   0, -10,
-            -10,   0,  10,  10,  10,  10,   0, -10,
+            -10,  -5,  -5,  -5,  -5,  -5,  -5, -10,
+              5,   0,   0,   0,   0,   0,   0,   5,
+            -10,   0,   5,   5,   5,   5,   0, -10,
             -10,   15,  5,  10,  10,   5,  15, -10,
-            -10,   0,  15,  10,  10,  15,   0, -10,
-            -10,  10,  10,  10,  10,  10,  10, -10,
-            -10,  10,   0,   0,   0,   0,  10, -10,
-            -20, -10, -10, -10, -10, -10, -10, -20
+             10,   0,  15,  10,  10,  15,   0,  10,
+            -10,   5,   5,   5,   5,   5,   5, -10,
+              5,  10,   0,   0,   0,   0,  10,   5,
+            -10,  -5,  -5,  -5,  -5,  -5,  -5, -10
     };
 
     private static final int[] BISHOP_TABLE_RAW_EG = {
@@ -368,6 +373,59 @@ static {
     int blended = (mgScore * phase + egScore * (PHASE_MAX - phase)) / PHASE_MAX;
 
     return b.sideToMove == WHITE ? blended : -blended;
+    }
+
+    /** Middlegame piece-square value, exposed package-private for evaluator regressions. */
+    static int pieceSquareMgValue(int color, int type, int square) {
+        return color == WHITE ? PST_MG_WHITE[type][square] : PST_MG_BLACK[type][square];
+    }
+
+    /**
+     * Returns a temporary root preference for a quiet bishop development move.
+     * The position must have both knights for each side, exactly one knight
+     * off its home squares per side, and all other non-pawn pieces still on
+     * their original home squares. Pawns may occupy any squares. This strict
+     * material/home-square pattern prevents captures or missing pieces from
+     * being mistaken for normal one-knight development.
+     */
+    static int openingBishopDevelopmentBonus(Board b, int move) {
+        if (Move.flag(move) != Move.QUIET) return 0;
+        int color = b.sideToMove;
+        int from = Move.from(move);
+        int homeRank = color == WHITE ? 0 : 7;
+        long bishopHomes = (1L << (homeRank * 8 + 2)) | (1L << (homeRank * 8 + 5));
+        long fromMask = 1L << from;
+        if ((bishopHomes & fromMask) == 0L
+                || (b.pieceBB[color][BISHOP] & fromMask) == 0L
+                || !hasOneDevelopedKnightEach(b)) {
+            return 0;
+        }
+        if (!allOtherNonPawnsRemainHome(b, WHITE) || !allOtherNonPawnsRemainHome(b, BLACK)) {
+            return 0;
+        }
+        return OPENING_BISHOP_DEVELOPMENT_BONUS;
+    }
+
+    private static boolean hasOneDevelopedKnightEach(Board b) {
+        for (int color = WHITE; color <= BLACK; color++) {
+            int homeRank = color == WHITE ? 0 : 7;
+            long knightHomes = (1L << (homeRank * 8 + 1)) | (1L << (homeRank * 8 + 6));
+            long knights = b.pieceBB[color][KNIGHT];
+            if (popcount(knights) != 2 || popcount(knights & knightHomes) != 1) return false;
+        }
+        return true;
+    }
+
+    private static boolean allOtherNonPawnsRemainHome(Board b, int color) {
+        int homeRank = color == WHITE ? 0 : 7;
+        long kingHome = 1L << (homeRank * 8 + 4);
+        long queenHome = 1L << (homeRank * 8 + 3);
+        long rookHomes = (1L << (homeRank * 8)) | (1L << (homeRank * 8 + 7));
+        long bishopHomes = (1L << (homeRank * 8 + 2)) | (1L << (homeRank * 8 + 5));
+        return b.pieceBB[color][KING] == kingHome
+                && b.pieceBB[color][QUEEN] == queenHome
+                && b.pieceBB[color][ROOK] == rookHomes
+                && b.pieceBB[color][BISHOP] == bishopHomes;
     }
 
     /** Returns white-relative pawn structure packed as signed MG/EG scores. */
@@ -707,12 +765,6 @@ static {
 
     private static int kingDangerMg(Board b, int attackingColor) {
         int defendingColor = opposite(attackingColor);
-        // Moved and exchanged/captured N/B/R/Q/K pieces both clear a slot;
-        // pawns never do. Skip attack generation until at least one slot clears.
-        int clearedSlots = developedOrExchangedNonPawnSlots(b, attackingColor);
-        int scale = kingDevelopmentScale(clearedSlots);
-        if (scale == 0) return 0;
-
         long innerZone = KING_INNER_ZONE[b.kingSquare(defendingColor)];
         long outerZone = KING_OUTER_ZONE[b.kingSquare(defendingColor)];
         long defendingOccupancy = b.occupancy[defendingColor];
@@ -796,24 +848,7 @@ static {
             danger = danger * KING_NO_QUEEN_NUMERATOR / KING_NO_QUEEN_DENOMINATOR;
         }
         danger += openFileDangerMg(b, attackingColor, defendingColor);
-        int cappedDanger = Math.min(danger, KING_DANGER_MG_CAP);
-        if (cappedDanger == 0) return 0;
-        return (cappedDanger * scale + 63) / 64;
-    }
-
-    /** Quadratic king-danger multiplier in sixty-fourths, for focused tests. */
-    static int kingDevelopmentScale(int clearedSlots) {
-        int slots = Math.max(0, Math.min(8, clearedSlots));
-        return slots * slots;
-    }
-
-    private static int developedOrExchangedNonPawnSlots(Board b, int color) {
-        long homeRank = color == WHITE ? RANK_1 : RANK_8;
-        int survivingHomePieces = 0;
-        for (int type = KNIGHT; type <= KING; type++) {
-            survivingHomePieces += popcount(b.pieceBB[color][type] & homeRank);
-        }
-        return Math.max(0, Math.min(8, 8 - survivingHomePieces));
+        return Math.min(danger, KING_DANGER_MG_CAP);
     }
 
     /** Positive MG penalty against {@code color}; package-private for tests. */

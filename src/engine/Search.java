@@ -107,6 +107,17 @@ public class Search {
     private static final int PROPHYLAXIS_EVASION_LIMIT = 16;
     private static final int PROPHYLAXIS_CONTINUATION_LIMIT = 3;
     private static final int PROPHYLAXIS_MOVE_BUFFER = 256;
+    private static final int TT_MOVE_SCORE = 2_000_000;
+    private static final int UNCLASSIFIED_CAPTURE_SCORE = 1_800_000;
+    private static final int GOOD_CAPTURE_SCORE = 1_600_000;
+    private static final int PROMOTION_SCORE = 1_400_000;
+    private static final int KILLER_SCORE = 1_200_000;
+    private static final int SECOND_KILLER_SCORE = 1_190_000;
+    private static final int QUIET_SCORE = 1_000_000;
+    private static final int LOSING_CAPTURE_SCORE = -1_000_000;
+    private static final int MAX_MVV_LVA_SCORE = 40_000;
+    private static final int BAD_CAPTURE_SEE_THRESHOLD = -300;
+    private static final int SEE_LMR_THRESHOLD = -300;
 
 
     public static final int MAX_PLY = 128;
@@ -143,7 +154,7 @@ public class Search {
     private long lmrReductionPlies;
     private long lmrDeepReductions;
     private long seeCalls;
-    private long mainTieBreakSeeCalls;
+    private long mainOrderingSeeCalls;
     private long qPruneSeeCalls;
     private long mainSeeDemotions;
     private long nullMoveAttempts;
@@ -151,9 +162,12 @@ public class Search {
     private long aspirationRetries;
     private long repetitionExits;
     private long fiftyMoveExits;
-    private long deadlineNanos;
-    private long softTimeNanos;
-    private boolean timeLimited;
+    private volatile long deadlineNanos;
+    private volatile long softTimeNanos;
+    private volatile long hardTimeNanos;
+    private volatile long budgetStartNanos;
+    private volatile boolean timeLimited;
+    private boolean rootBishopPreferenceActive;
     private boolean rootDrawClaimed;
 
     private int rootBestMove;
@@ -186,8 +200,9 @@ public class Search {
         public final long lmrDeepReductions;
         public final long seeCalls;
         public final long mainTieBreakSeeCalls;
-        /** @deprecated use mainTieBreakSeeCalls. */
+        /** @deprecated use mainOrderingSeeCalls. */
         public final long mainOrderSeeCalls;
+        public final long mainOrderingSeeCalls;
         public final long qPruneSeeCalls;
         public final long mainSeeDemotions;
         public final long nullMoveAttempts;
@@ -204,7 +219,7 @@ public class Search {
                             long quiescenceBetaCutoffs, long firstMoveCutoffs,
                             long legalMovesSearched, long lmrAttempts, long lmrReducedSearches,
                             long lmrFullDepthResearches, long lmrReductionPlies,
-                            long lmrDeepReductions, long seeCalls, long mainTieBreakSeeCalls,
+                            long lmrDeepReductions, long seeCalls, long mainOrderingSeeCalls,
                             long qPruneSeeCalls, long mainSeeDemotions, long nullMoveAttempts,
                             long nullMoveCutoffs, long aspirationRetries, long repetitionExits,
                             long fiftyMoveExits, boolean instrumentationEnabled) {
@@ -229,8 +244,9 @@ public class Search {
             this.lmrReductionPlies = lmrReductionPlies;
             this.lmrDeepReductions = lmrDeepReductions;
             this.seeCalls = seeCalls;
-            this.mainTieBreakSeeCalls = mainTieBreakSeeCalls;
-            this.mainOrderSeeCalls = mainTieBreakSeeCalls;
+            this.mainTieBreakSeeCalls = mainOrderingSeeCalls;
+            this.mainOrderSeeCalls = mainOrderingSeeCalls;
+            this.mainOrderingSeeCalls = mainOrderingSeeCalls;
             this.qPruneSeeCalls = qPruneSeeCalls;
             this.mainSeeDemotions = mainSeeDemotions;
             this.nullMoveAttempts = nullMoveAttempts;
@@ -268,7 +284,7 @@ public class Search {
                     enabled ? search.lmrReductionPlies : 0,
                     enabled ? search.lmrDeepReductions : 0,
                     enabled ? search.seeCalls : 0,
-                    enabled ? search.mainTieBreakSeeCalls : 0,
+                    enabled ? search.mainOrderingSeeCalls : 0,
                     enabled ? search.qPruneSeeCalls : 0,
                     enabled ? search.mainSeeDemotions : 0,
                     enabled ? search.nullMoveAttempts : 0,
@@ -301,7 +317,7 @@ public class Search {
                     + " lmrReductionPlies=" + lmrReductionPlies
                     + " lmrDeep=" + lmrDeepReductions
                     + " seeCalls=" + seeCalls
-                    + " mainTieBreakSeeCalls=" + mainTieBreakSeeCalls
+                    + " mainOrderSeeCalls=" + mainOrderingSeeCalls
                     + " qSeePruneCalls=" + qPruneSeeCalls
                     + " mainSeeDemotions=" + mainSeeDemotions
                     + " nullAttempts=" + nullMoveAttempts
@@ -436,12 +452,38 @@ public class Search {
     int searchPrepared(Board board, int maxDepth, long softTimeMillis, long hardTimeMillis,
                        long[] gameHistoryKeys) {
         return searchInternal(board, maxDepth, softTimeMillis, hardTimeMillis,
-                gameHistoryKeys, false);
+                gameHistoryKeys, false, null);
+    }
+
+    int searchPrepared(Board board, int maxDepth, long softTimeMillis, long hardTimeMillis,
+                       long[] gameHistoryKeys, Runnable timeControlReady) {
+        return searchInternal(board, maxDepth, softTimeMillis, hardTimeMillis,
+                gameHistoryKeys, false, timeControlReady);
+    }
+
+    /** Start the real move clock without discarding work from an active ponder search. */
+    void activateTimeLimits(long softTimeMillis, long hardTimeMillis) {
+        long now = System.nanoTime();
+        long hardNanos = millisToNanos(hardTimeMillis);
+        budgetStartNanos = now;
+        softTimeNanos = softTimeMillis >= 0 ? millisToNanos(softTimeMillis) : Long.MAX_VALUE;
+        hardTimeNanos = hardNanos;
+        deadlineNanos = hardTimeMillis >= 0 && hardNanos != Long.MAX_VALUE
+                ? deadlineAfter(now, hardNanos) : Long.MAX_VALUE;
+        // Publish this last so the worker observes a complete budget update.
+        timeLimited = hardTimeMillis >= 0 && hardNanos != Long.MAX_VALUE;
     }
 
     private int searchInternal(Board board, int maxDepth, long softTimeMillis,
                                long hardTimeMillis, long[] gameHistoryKeys,
                                boolean resetStopRequest) {
+        return searchInternal(board, maxDepth, softTimeMillis, hardTimeMillis,
+                gameHistoryKeys, resetStopRequest, null);
+    }
+
+    private int searchInternal(Board board, int maxDepth, long softTimeMillis,
+                               long hardTimeMillis, long[] gameHistoryKeys,
+                               boolean resetStopRequest, Runnable timeControlReady) {
         if (resetStopRequest) stopRequested = false;
         lastProphylaxisDiagnostics = null;
         nodes = 0;
@@ -465,7 +507,7 @@ public class Search {
         lmrReductionPlies = 0;
         lmrDeepReductions = 0;
         seeCalls = 0;
-        mainTieBreakSeeCalls = 0;
+        mainOrderingSeeCalls = 0;
         qPruneSeeCalls = 0;
         mainSeeDemotions = 0;
         nullMoveAttempts = 0;
@@ -489,12 +531,16 @@ public class Search {
         long startNanos = System.nanoTime();
         long hardNanos = millisToNanos(hardTimeMillis);
         timeLimited = hardTimeMillis >= 0 && hardNanos != Long.MAX_VALUE;
+        budgetStartNanos = startNanos;
+        hardTimeNanos = hardNanos;
         deadlineNanos = timeLimited ? deadlineAfter(startNanos, hardNanos) : Long.MAX_VALUE;
         softTimeNanos = softTimeMillis >= 0 ? millisToNanos(softTimeMillis) : Long.MAX_VALUE;
+        if (timeControlReady != null) timeControlReady.run();
 
         int depthLimit = maxDepth > 0 ? maxDepth : MAX_PLY - 4;
         rootBestMove = Move.NONE;
         iterationBestMove = Move.NONE;
+        rootBishopPreferenceActive = false;
         rootDrawClaimed = false;
         MoveList rootMoves = new MoveList();
         MoveGenerator.generateLegal(board, rootMoves);
@@ -506,6 +552,12 @@ public class Search {
             }
             lastStats = SearchStats.capture(this);
             return rootBestMove;
+        }
+        for (int i = 0; i < rootMoves.size; i++) {
+            if (Evaluator.openingBishopDevelopmentBonus(board, rootMoves.get(i)) > 0) {
+                rootBishopPreferenceActive = true;
+                break;
+            }
         }
         int bestScore = 0;
         int window = 25; // centipawns, tunable
@@ -519,18 +571,19 @@ public class Search {
 
         for (int depth = 1; depth <= depthLimit; depth++) {
             long now = System.nanoTime();
-            long usedBeforeIteration = now - startNanos;
+            long usedBeforeIteration = now - budgetStartNanos;
+            long currentHardNanos = hardTimeNanos;
             // Normal clock mode predicts only against the hard deadline. Soft
             // stopping happens after an actual completed iteration; movetime
             // uses equal soft/hard limits and remains deadline-driven.
-            if (timeLimited && softTimeNanos < hardNanos && lastIterationNanos > 0) {
+            if (timeLimited && softTimeNanos < currentHardNanos && lastIterationNanos > 0) {
                 double growthFactor = previousIterationNanos > 0
                         ? Math.max(1.0, Math.min(3.0,
                                 (double) lastIterationNanos / previousIterationNanos)) : 2.0;
                 long growthEstimate = lastIterationNanos > Long.MAX_VALUE / growthFactor
                         ? Long.MAX_VALUE : (long) (lastIterationNanos * growthFactor);
                 if (!SearchTimePolicy.shouldStartNextIteration(usedBeforeIteration,
-                        growthEstimate, hardNanos)) break;
+                        growthEstimate, currentHardNanos)) break;
             }
             long iterationStartNanos = now;
             iterationBestMove = Move.NONE;
@@ -598,9 +651,9 @@ public class Search {
                     elapsedMs);
 
             if (stopRequested) break;
-            long completedElapsedNanos = System.nanoTime() - startNanos;
+            long completedElapsedNanos = System.nanoTime() - budgetStartNanos;
             if (timeLimited && SearchTimePolicy.shouldStopAtSoftAfterCompletedIteration(
-                    completedElapsedNanos, softTimeNanos, hardNanos, stableIterations >= 2)) {
+                    completedElapsedNanos, softTimeNanos, hardTimeNanos, stableIterations >= 2)) {
                 break;
             }
             if (Math.abs(bestScore) >= MATE_SCORE - MAX_PLY) break; // forced mate found
@@ -774,7 +827,8 @@ public class Search {
             // A TT score is safe only inside the search that produced it, and
             // not when this position has already occurred on the actual-game
             // history or active line. The move remains useful for ordering.
-            if (usableRootTtMove && !repetitionSensitive && tt.isCurrentGeneration(entry)
+            if (usableRootTtMove && !(searchPly == 0 && rootBishopPreferenceActive)
+                    && !repetitionSensitive && tt.isCurrentGeneration(entry)
                     && TranspositionTable.depthOf(entry) >= depth) {
                 int score = adjustMateFromTT(TranspositionTable.scoreOf(entry), searchPly);
                 int flag = TranspositionTable.flagOf(entry);
@@ -815,6 +869,8 @@ public class Search {
         int legalCount = 0;
         int bestScore = -INFINITY_SCORE;
         int bestMove = Move.NONE;
+        int exactBishopMove = Move.NONE;
+        int exactBishopScore = -INFINITY_SCORE;
         int us = board.sideToMove;
         boolean probeThisRoot = searchPly == 0 && prophylaxisProbeEnabled
                 && depth >= PROPHYLAXIS_MIN_DEPTH
@@ -822,9 +878,7 @@ public class Search {
         if (probeThisRoot) beginProphylaxisRoot(board, depth, us);
 
         for (int i = 0; i < moves.size; i++) {
-            int bestIdx = i;
-            for (int j = i + 1; j < moves.size; j++) if (scores[j] > scores[bestIdx]) bestIdx = j;
-            bestIdx = maybeDemoteLosingCapture(board, moves, scores, bestIdx, depth, searchPly);
+            int bestIdx = selectNextMove(board, moves, scores, i, depth, searchPly);
             if (bestIdx != i) {
                 int tmpM = moves.moves[i]; moves.moves[i] = moves.moves[bestIdx]; moves.moves[bestIdx] = tmpM;
                 int tmpS = scores[i]; scores[i] = scores[bestIdx]; scores[bestIdx] = tmpS;
@@ -833,6 +887,8 @@ public class Search {
             long candidateStartNodes = searchPly == 0 && rootCandidateListener != null
                     ? nodes : 0;
             int candidateAlpha = alpha;
+            int bishopBonus = searchPly == 0
+                    ? Evaluator.openingBishopDevelopmentBonus(board, move) : 0;
             board.makeMove(move);
             if (board.isInCheck(us)) {
                 board.unmakeMove();
@@ -843,14 +899,18 @@ public class Search {
 
             int score;
             boolean childRepetitionTainted;
+            boolean candidateSearchExact;
             if (legalCount == 1) {
                 score = -negamax(board, depth - 1, -beta, -alpha, searchPly + 1, true);
                 childRepetitionTainted = repetitionTainted[searchPly + 1];
+                candidateSearchExact = score > alpha && score < beta;
             } else {
                 boolean givesCheck = board.isInCheck(board.sideToMove);
                 boolean advancedPasser = isAdvancedPassedPawnPush(board, move, us);
-                int reduction = lmrReductionForMove(move, depth, legalCount, searchPly,
-                        ttMove, inCheck, givesCheck, advancedPasser, board, us);
+                int reduction = bishopBonus > 0 ? 0
+                        : lmrReductionForMove(move, depth, legalCount, searchPly,
+                                ttMove, inCheck, givesCheck, advancedPasser, board, us,
+                                captureSeeFromScore(scores[i]));
                 if (reduction > 0) {
                     if (instrumentationEnabled) {
                         lmrAttempts++;
@@ -859,16 +919,35 @@ public class Search {
                         if (reduction >= 2) lmrDeepReductions++;
                     }
                 }
-                score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, searchPly + 1, true);
+                // Test an eligible bishop against the raw root alpha minus
+                // its temporary preference. If it cannot clear this shifted
+                // threshold, it cannot outrank the current raw best even
+                // after the bonus; if it can, the re-search obtains its exact
+                // raw score. Child TT values and the root score stay unshifted.
+                int scoutAlpha = bishopBonus > 0 ? alpha - bishopBonus : alpha;
+                score = -negamax(board, depth - 1 - reduction,
+                        -scoutAlpha - 1, -scoutAlpha, searchPly + 1, true);
                 childRepetitionTainted = repetitionTainted[searchPly + 1];
-                if (score > alpha) {
+                if (score > scoutAlpha) {
                     if (instrumentationEnabled && reduction > 0) lmrFullDepthResearches++;
-                    score = -negamax(board, depth - 1, -beta, -alpha, searchPly + 1, true);
+                    score = -negamax(board, depth - 1, -beta, -scoutAlpha,
+                            searchPly + 1, true);
                     childRepetitionTainted |= repetitionTainted[searchPly + 1];
+                    candidateSearchExact = score > scoutAlpha && score < beta;
+                } else {
+                    candidateSearchExact = false;
                 }
             }
 
-            boolean candidateExact = score > candidateAlpha && score < beta;
+            boolean candidateExact = candidateSearchExact;
+            if (bishopBonus > 0 && !isMateScore(score)) {
+                if (candidateExact) {
+                    if (score > exactBishopScore) {
+                        exactBishopMove = move;
+                        exactBishopScore = score;
+                    }
+                }
+            }
             if (probeThisRoot && candidateExact && legalCount <= PROPHYLAXIS_MAX_ROOT_RANK
                     && !Move.isPromotion(move)
                     && !board.isInCheck(board.sideToMove)
@@ -951,18 +1030,32 @@ public class Search {
         if (searchPly == 0) {
             int selectedProbe = rootExact && !stopRequested
                     ? selectProphylacticRootCandidate(bestMove, bestScore, depth) : -1;
+            int selectedMove = bestMove;
+            int selectedRawScore = bestScore;
             if (selectedProbe >= 0) {
-                iterationBestMove = prophylaxisMoves[selectedProbe];
-                iterationReportedScore = prophylaxisNormalScores[selectedProbe];
-                updateProphylaxisDiagnostics(selectedProbe, depth);
-                return bestScore;
+                selectedMove = prophylaxisMoves[selectedProbe];
+                selectedRawScore = prophylaxisNormalScores[selectedProbe];
             }
-            iterationBestMove = bestMove;
-            iterationReportedScore = bestScore;
-            finishProphylaxisDiagnostics(bestMove, bestScore, depth);
+            if (rootExact && !stopRequested && !isMateScore(selectedRawScore)) {
+                int exactBonus = exactBishopMove == Move.NONE ? 0
+                        : Evaluator.openingBishopDevelopmentBonus(board, exactBishopMove);
+                int selectedBonus = Evaluator.openingBishopDevelopmentBonus(board, selectedMove);
+                if (exactBishopMove != Move.NONE && exactBonus > 0
+                        && exactBishopScore + exactBonus > selectedRawScore + selectedBonus) {
+                    selectedMove = exactBishopMove;
+                    selectedRawScore = exactBishopScore;
+                }
+            }
+            iterationBestMove = selectedMove;
+            iterationReportedScore = selectedRawScore;
+            finishProphylaxisDiagnostics(selectedMove, selectedRawScore, depth);
         }
 
         return bestScore;
+    }
+
+    private static boolean isMateScore(int score) {
+        return Math.abs(score) >= MATE_SCORE - MAX_PLY;
     }
 
     private boolean isProphylaxisRootEligible(Board board, boolean inCheck) {
@@ -1658,11 +1751,26 @@ public class Search {
                             boolean advancedPasser) {
         if (!lmrEnabled
                 || inCheck || givesCheck || advancedPasser
-                || Move.isCapture(move) || Move.isPromotion(move)
+                || Move.isPromotion(move)
                 || move == ttMove || searchPly < 0 || searchPly >= MAX_PLY
                 || move == killerMoves[searchPly][0] || move == killerMoves[searchPly][1]) {
             return 0;
         }
+        if (Move.isCapture(move)) return 0;
+        return lateMoveReduction(depth, moveRank);
+    }
+
+    int lmrReductionForMove(int move, int depth, int moveRank, int searchPly,
+                            int ttMove, boolean inCheck, boolean givesCheck,
+                            boolean advancedPasser, int captureSee) {
+        if (!lmrEnabled || inCheck || givesCheck || advancedPasser
+                || Move.isPromotion(move) || move == ttMove
+                || searchPly < 0 || searchPly >= MAX_PLY
+                || move == killerMoves[searchPly][0] || move == killerMoves[searchPly][1]) {
+            return 0;
+        }
+        if (Move.isCapture(move)
+                && (Move.isEnPassant(move) || captureSee > SEE_LMR_THRESHOLD)) return 0;
         return lateMoveReduction(depth, moveRank);
     }
 
@@ -1672,6 +1780,15 @@ public class Search {
         if (isNearRootPawnOffer(positionAfterMove, move, moverColor, searchPly)) return 0;
         return lmrReductionForMove(move, depth, moveRank, searchPly,
                 ttMove, inCheck, givesCheck, advancedPasser);
+    }
+
+    int lmrReductionForMove(int move, int depth, int moveRank, int searchPly,
+                            int ttMove, boolean inCheck, boolean givesCheck,
+                            boolean advancedPasser, Board positionAfterMove, int moverColor,
+                            int captureSee) {
+        if (isNearRootPawnOffer(positionAfterMove, move, moverColor, searchPly)) return 0;
+        return lmrReductionForMove(move, depth, moveRank, searchPly,
+                ttMove, inCheck, givesCheck, advancedPasser, captureSee);
     }
 
     /**
@@ -1833,12 +1950,16 @@ public class Search {
                             int searchPly, int[] scores) {
         for (int i = 0; i < moves.size; i++) {
             int move = moves.get(i);
-            if (move == ttMove) scores[i] = 2_000_000;
-            else if (Move.isCapture(move)) scores[i] = 1_000_000 + mvvLva(board, move);
-            else if (Move.isPromotion(move)) scores[i] = 900_000 + PIECE_VALUE[Move.promotionPieceType(move)];
-            else if (move == killerMoves[searchPly][0]) scores[i] = 800_000;
-            else if (move == killerMoves[searchPly][1]) scores[i] = 790_000;
-            else scores[i] = historyTable[Move.from(move)][Move.to(move)];
+            if (move == ttMove) scores[i] = TT_MOVE_SCORE;
+            else if (Move.isPromotion(move)) {
+                scores[i] = PROMOTION_SCORE + PIECE_VALUE[Move.promotionPieceType(move)]
+                        + (Move.isCapture(move) ? mvvLva(board, move) : 0);
+            } else if (Move.isCapture(move)) {
+                scores[i] = UNCLASSIFIED_CAPTURE_SCORE + mvvLva(board, move);
+            } else if (move == killerMoves[searchPly][0]) scores[i] = KILLER_SCORE;
+            else if (move == killerMoves[searchPly][1]) scores[i] = SECOND_KILLER_SCORE;
+            else scores[i] = QUIET_SCORE + Math.max(-100_000,
+                    Math.min(100_000, historyTable[Move.from(move)][Move.to(move)]));
         }
     }
 
@@ -1846,52 +1967,52 @@ public class Search {
         for (int i = 0; i < moves.size; i++) scores[i] = mvvLva(board, moves.get(i));
     }
 
-    private int maybeDemoteLosingCapture(Board board, MoveList moves, int[] scores,
-                                         int bestIdx, int depth, int searchPly) {
-        int selected = moves.get(bestIdx);
-        if (depth < 5 || !isEligibleMainTieCapture(board, selected)) return bestIdx;
-        int rawScore = scores[bestIdx];
-        // Pay for SEE only when the legacy selection has selected a capture
-        // and a tied capture remains in the suffix.
-        boolean hasTiedCapture = false;
-        for (int j = bestIdx + 1; j < moves.size; j++) {
-            if (scores[j] == rawScore && isEligibleMainTieCapture(board, moves.get(j))) {
-                hasTiedCapture = true;
-                break;
+    /**
+     * Returns the next move index in staged order. Captures begin in an
+     * unclassified band; only the current highest candidate receives SEE.
+     * Its result is cached in the score so it is never recomputed at this node.
+     */
+    int selectNextMove(Board board, MoveList moves, int[] scores,
+                       int startIndex, int depth, int searchPly) {
+        while (true) {
+            int bestIdx = startIndex;
+            for (int j = startIndex + 1; j < moves.size; j++) {
+                if (scores[j] > scores[bestIdx]) bestIdx = j;
             }
-        }
-        if (!hasTiedCapture) return bestIdx;
+            int selectedScore = scores[bestIdx];
+            if (!Move.isCapture(moves.get(bestIdx)) || Move.isPromotion(moves.get(bestIdx))
+                    || selectedScore < UNCLASSIFIED_CAPTURE_SCORE
+                    || selectedScore >= UNCLASSIFIED_CAPTURE_SCORE + MAX_MVV_LVA_SCORE) {
+                return bestIdx;
+            }
 
-        int selectedSee = selectiveSeeForTie(board, selected, searchPly);
-        if (selectedSee > -300) return bestIdx;
-        for (int j = bestIdx + 1; j < moves.size; j++) {
-            if (scores[j] != rawScore || !isEligibleMainTieCapture(board, moves.get(j))) continue;
-            int candidateSee = selectiveSeeForTie(board, moves.get(j), searchPly);
-            if (candidateSee >= 0) {
+            int move = moves.get(bestIdx);
+            int see = StaticExchange.evaluate(board, move, seeGains[searchPly]);
+            if (instrumentationEnabled) {
+                seeCalls++;
+                mainOrderingSeeCalls++;
+            }
+            if (rootBishopPreferenceActive) {
+                // Keep all capture sub-stages unchanged throughout this
+                // root-preference search, not only the placement of losers.
+                scores[bestIdx] = GOOD_CAPTURE_SCORE + mvvLva(board, move);
+            } else if (see > BAD_CAPTURE_SEE_THRESHOLD) {
+                scores[bestIdx] = GOOD_CAPTURE_SCORE + mvvLva(board, move);
+            } else {
+                int cachedSee = Math.max(-MAX_MVV_LVA_SCORE,
+                        Math.min(-1, see));
+                scores[bestIdx] = LOSING_CAPTURE_SCORE + cachedSee;
                 if (instrumentationEnabled) mainSeeDemotions++;
-                return j;
             }
         }
-        return bestIdx;
     }
 
-    private boolean isEligibleMainTieCapture(Board board, int move) {
-        if (!Move.isCapture(move) || Move.isPromotion(move) || Move.isEnPassant(move)) return false;
-        int attacker = board.pieceTypeAt(Move.from(move));
-        int victim = board.pieceTypeAt(Move.to(move));
-        return attacker >= 0 && victim >= 0 && PIECE_VALUE[attacker] > PIECE_VALUE[victim];
-    }
-
-    private int selectiveSeeForTie(Board board, int move, int searchPly) {
-        int attacker = board.pieceTypeAt(Move.from(move));
-        int victim = Move.isEnPassant(move) ? PAWN : board.pieceTypeAt(Move.to(move));
-        if (attacker < 0 || victim < 0 || PIECE_VALUE[attacker] <= PIECE_VALUE[victim]) return 0;
-        int see = StaticExchange.evaluate(board, move, seeGains[searchPly]);
-        if (instrumentationEnabled) {
-            seeCalls++;
-            mainTieBreakSeeCalls++;
+    private static int captureSeeFromScore(int score) {
+        if (score <= LOSING_CAPTURE_SCORE
+                && score >= LOSING_CAPTURE_SCORE - MAX_MVV_LVA_SCORE) {
+            return score - LOSING_CAPTURE_SCORE;
         }
-        return see;
+        return Integer.MAX_VALUE;
     }
 
     private int mvvLva(Board board, int move) {

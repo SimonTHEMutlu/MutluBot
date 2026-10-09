@@ -10,6 +10,7 @@ public final class EvaluatorTest {
         testBackwardPawnDefinition();
         testIsolatedPawnWeightsAndTaper();
         testPawnStructureSymmetry();
+        testCentralPawnAdvanceCalibration();
         testRookOpenAndSemiOpenFiles();
         testPassedPawnValues();
         testPassedPawnScoreIsApplied();
@@ -17,8 +18,9 @@ public final class EvaluatorTest {
         testOwnPassedPawnProximity();
         testEnemyPawnProximityAndPhaseTaper();
         testKingAttackUnitMapping();
-        testKingDangerDevelopmentGate();
-        testKingDevelopmentScale();
+        testKingPressureUsesBoardThreatsOnly();
+        testKingPressureDoesNotDependOnHomeRankPieceCount();
+        testGameFiveBishopRetreatEvaluation();
         testSinglePieceKingPressure();
         testNonlinearKingPressure();
         testCentralQueenOuterRayIsIgnored();
@@ -37,6 +39,7 @@ public final class EvaluatorTest {
         testPawnShelterPhaseTaper();
         testQueenPresentForwardCover();
         testColorAndSideToMoveSymmetry();
+        testOpeningBishopDevelopmentBonus();
         System.out.println("EvaluatorTest passed");
     }
 
@@ -229,6 +232,69 @@ public final class EvaluatorTest {
                 "two-push support is recognized symmetrically for both colors");
     }
 
+    private static void testCentralPawnAdvanceCalibration() {
+        Board blackToMove = board("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2");
+        int blackBefore = Evaluator.evaluate(blackToMove);
+        play(blackToMove, "d7d5");
+        int blackAfter = -Evaluator.evaluate(blackToMove);
+        int blackCentralAdvanceGain = blackAfter - blackBefore;
+        check(blackCentralAdvanceGain == 25,
+                "black d7-d5 receives the calibrated 25cp PST gain instead of 45cp");
+
+        Board whiteToMove = board("rnbqkb1r/pppp1ppp/5n2/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 1 2");
+        int whiteBefore = Evaluator.evaluate(whiteToMove);
+        play(whiteToMove, "d2d4");
+        int whiteAfter = -Evaluator.evaluate(whiteToMove);
+        int whiteCentralAdvanceGain = whiteAfter - whiteBefore;
+        check(whiteCentralAdvanceGain == blackCentralAdvanceGain,
+                "central d-pawn advance incentive mirrors by color and direction");
+
+        Board initial = new Board();
+        int initialWhite = Evaluator.evaluate(initial);
+        Board dPawnAdvanced = board(initial.toFen());
+        play(dPawnAdvanced, "d2d4");
+        int dPawnGain = -Evaluator.evaluate(dPawnAdvanced) - initialWhite;
+        Board ePawnAdvanced = board(initial.toFen());
+        play(ePawnAdvanced, "e2e4");
+        int ePawnGain = -Evaluator.evaluate(ePawnAdvanced) - initialWhite;
+        check(dPawnGain == 25 && ePawnGain == 25,
+                "starting-position d/e two-square pawn advances receive 25cp in mirror symmetry");
+
+        Board samePositionBlackToMove = board("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 1 2");
+        check(Evaluator.evaluate(samePositionBlackToMove) == -blackBefore,
+                "central pawn PST calibration preserves side-to-move score symmetry");
+    }
+
+    private static void testOpeningBishopDevelopmentBonus() {
+        Board afterOneKnightEach = board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 3 3");
+        check(Evaluator.openingBishopDevelopmentBonus(afterOneKnightEach, findLegalMove(afterOneKnightEach, "f1c4")) == 8,
+                "quiet bishop development gets the small one-ply preference after both sides develop one knight");
+        check(Evaluator.openingBishopDevelopmentBonus(afterOneKnightEach, findLegalMove(afterOneKnightEach, "f3g5")) == 0,
+                "non-bishop moves receive no opening development preference");
+        check(Evaluator.openingBishopDevelopmentBonus(afterOneKnightEach,
+                        Move.encode(square("f1"), square("b5"), Move.CAPTURE)) == 0,
+                "capture-flagged moves do not receive the quiet bishop preference");
+
+        Board afterBothWhiteKnights = board("r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 5 4");
+        check(Evaluator.openingBishopDevelopmentBonus(afterBothWhiteKnights,
+                        findLegalMove(afterBothWhiteKnights, "f1b5")) == 0,
+                "the four-knights position is outside the one-knight-per-side condition");
+
+        Board missingKnight = board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/R1BQKB1R w KQkq - 3 3");
+        check(Evaluator.openingBishopDevelopmentBonus(missingKnight,
+                        findLegalMove(missingKnight, "f1c4")) == 0,
+                "a missing knight cannot masquerade as a developed knight");
+
+        Board blackToMove = board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 3 2");
+        check(Evaluator.openingBishopDevelopmentBonus(blackToMove, findLegalMove(blackToMove, "f8c5")) == 8,
+                "the bishop preference works symmetrically for Black");
+
+        Board earlyBishopMoved = board("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 4 3");
+        check(Evaluator.openingBishopDevelopmentBonus(earlyBishopMoved,
+                        findLegalMove(earlyBishopMoved, "f8c5")) == 0,
+                "a previously moved bishop ends the one-move opening condition");
+    }
+
     private static void testRookOpenAndSemiOpenFiles() {
         Board open = board("7k/8/8/8/R7/8/8/K7 w - - 0 1");
         Board semiOpen = board("7k/p7/8/8/R7/8/8/K7 w - - 0 1");
@@ -262,25 +328,25 @@ public final class EvaluatorTest {
                 "...Rac8 uses the open c-file more actively than ...Qa5");
     }
 
-    private static void testKingDangerDevelopmentGate() {
+    private static void testKingPressureUsesBoardThreatsOnly() {
         check(Evaluator.kingPressureMg(new Board(), WHITE) == 0,
                 "undeveloped starting position has no king danger");
 
         Board exactlyFour = board("6k1/8/8/8/6R1/2NQ4/1B6/RNB1K3 w - - 0 1");
         check(Evaluator.kingPressureMg(exactlyFour, WHITE) > 0,
-                "four cleared back-rank slots permit scaled king danger");
+                "actual attacks near the king create danger");
 
         Board fiveMoved = board("6k1/8/8/8/6R1/N1NQ4/1B6/R1B1K3 w - - 0 1");
         check(Evaluator.kingPressureMg(fiveMoved, WHITE) > 0,
-                "five moved back-rank slots permit king danger");
+                "king danger remains present with additional developed pieces");
 
         Board pawnsOnly = board("6k1/8/8/8/8/PPPPPPPP/8/RNBQKBNR w - - 0 1");
         check(Evaluator.kingPressureMg(pawnsOnly, WHITE) == 0,
-                "pawns do not clear back-rank slots");
+                "pawns without attacks into the king zone create no danger");
 
         Board fifthExchanged = board("6k1/8/8/8/6R1/2NQ4/1B6/RN2K3 w - - 0 1");
         check(Evaluator.kingPressureMg(fifthExchanged, WHITE) > 0,
-                "an exchanged back-rank slot contributes to development scale");
+                "king danger comes from board attacks even after exchanges");
 
         Board blackFour = board("rnb1k3/1b6/2nq4/6r1/8/8/8/6K1 b - - 0 1");
         Board blackFive = board("rn2k3/1b6/2nq4/6r1/8/8/8/6K1 b - - 0 1");
@@ -295,23 +361,39 @@ public final class EvaluatorTest {
                 "king danger respects side-to-move perspective");
     }
 
-    private static void testKingDevelopmentScale() {
-        int previous = Evaluator.kingDevelopmentScale(0);
-        for (int slots = 1; slots <= 8; slots++) {
-            int scale = Evaluator.kingDevelopmentScale(slots);
-            check(scale > previous, "development scale rises at slot " + slots);
-            previous = scale;
-        }
-        check(Evaluator.kingDevelopmentScale(1) == 1,
-                "one cleared slot permits only 1/64 king danger");
-        check(Evaluator.kingDevelopmentScale(4) == 16
-                        && Evaluator.kingDevelopmentScale(5) == 25,
-                "four-to-five development step is gradual and quadratic");
-        check(Evaluator.kingDevelopmentScale(8) == 64,
-                "fully cleared back rank enables full king danger");
+    private static void testKingPressureDoesNotDependOnHomeRankPieceCount() {
+        Board queenAttack = board("7k/6Q1/8/8/8/8/8/4K3 w - - 0 1");
+        Board sameAttackWithHomeKnight = board("7k/6Q1/8/8/8/8/8/1N2K3 w - - 0 1");
+        check(Evaluator.kingPressureMg(queenAttack, WHITE)
+                        == Evaluator.kingPressureMg(sameAttackWithHomeKnight, WHITE),
+                "an irrelevant home-rank piece cannot globally suppress an existing king attack");
+
         Board oneSlotAttacking = board("6k1/8/8/8/2B5/8/8/RNBQK1NR w - - 0 1");
         check(Evaluator.kingPressureMg(oneSlotAttacking, WHITE) > 0,
-                "one cleared slot gives a small positive bonus for a real king-zone attack");
+                "real king-zone pressure is scored without a development-count threshold");
+    }
+
+    private static void testGameFiveBishopRetreatEvaluation() {
+        Board before = board("2r1r1k1/pp2bppp/1qn5/2N5/3p2bP/P2N2P1/1P2PPB1/2RQR1K1 b - - 0 19");
+        int bishopOnF6 = Evaluator.pieceSquareMgValue(BLACK, Piece.BISHOP, square("f6"));
+        int bishopOnF8 = Evaluator.pieceSquareMgValue(BLACK, Piece.BISHOP, square("f8"));
+        check(bishopOnF6 > bishopOnF8 && bishopOnF6 - bishopOnF8 <= 10,
+                "bishop PST gives only a modest preference to f6 over the sound retreat square f8");
+
+        Board afterBf6 = board(before.toFen());
+        Board afterBf8 = board(before.toFen());
+        play(afterBf6, "e7f6");
+        play(afterBf8, "e7f8");
+        check((afterBf6.pieceBB[BLACK][Piece.BISHOP] & (1L << square("f6"))) != 0L
+                        && (afterBf8.pieceBB[BLACK][Piece.BISHOP] & (1L << square("f8"))) != 0L,
+                "Game 5 comparison positions represent ...Bf6 and ...Bf8 from the supplied regression FEN");
+        int blackScoreAfterBf6 = -Evaluator.evaluate(afterBf6);
+        int blackScoreAfterBf8 = -Evaluator.evaluate(afterBf8);
+        int staticBf6Preference = blackScoreAfterBf6 - blackScoreAfterBf8;
+        check(staticBf6Preference >= 0 && staticBf6Preference <= 10,
+                "total static evaluation prefers ...Bf6 over ...Bf8 by no more than the intended 10cp");
+        check(Evaluator.kingPressureMg(afterBf6, BLACK) == Evaluator.kingPressureMg(afterBf8, BLACK),
+                "returning the bishop to f8 does not globally reduce Black's king pressure in Game 5");
     }
 
     private static void testNonlinearKingPressure() {
@@ -545,6 +627,16 @@ public final class EvaluatorTest {
             }
         }
         throw new AssertionError("illegal move " + uci + " in " + board.toFen());
+    }
+
+    private static int findLegalMove(Board board, String uci) {
+        MoveList moves = new MoveList();
+        MoveGenerator.generateLegal(board, moves);
+        for (int i = 0; i < moves.size; i++) {
+            int move = moves.get(i);
+            if (Move.toUci(move).equals(uci)) return move;
+        }
+        throw new AssertionError("expected legal move " + uci + " in " + board.toFen());
     }
 
     private static int evaluateWithoutActivity(Board board) {

@@ -22,10 +22,58 @@ public class UCIEngine {
     private TranspositionTable tt = new TranspositionTable(64); // MB
     private Search search = new Search(tt);
     private boolean prophylaxisProbeEnabled = true;
+    private boolean ponderOptionEnabled;
     private final List<Long> gameHistory = new ArrayList<>();
 
     private Thread searchThread;
     private volatile long searchGeneration;
+    private volatile PonderControl activePonderControl;
+
+    private static final class PonderControl {
+        private final Search taskSearch;
+        private final long softTimeBudget;
+        private final long hardTimeBudget;
+        private boolean hit;
+        private boolean released;
+
+        PonderControl(Search taskSearch, long softTimeBudget, long hardTimeBudget) {
+            this.taskSearch = taskSearch;
+            this.softTimeBudget = softTimeBudget;
+            this.hardTimeBudget = hardTimeBudget;
+        }
+
+        synchronized void ponderHit() {
+            if (released) return;
+            hit = true;
+            taskSearch.activateTimeLimits(softTimeBudget, hardTimeBudget);
+            notifyAll();
+        }
+
+        synchronized void timeControlReady() {
+            // Covers the race where ponderhit arrives before Search finishes
+            // initializing its initially-unlimited ponder clock.
+            if (hit && !released) {
+                taskSearch.activateTimeLimits(softTimeBudget, hardTimeBudget);
+            }
+        }
+
+        synchronized void release() {
+            released = true;
+            notifyAll();
+        }
+
+        synchronized void awaitHitOrRelease() {
+            boolean interrupted = false;
+            while (!hit && !released) {
+                try {
+                    wait();
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
 
     public static void main(String[] args) {
         new UCIEngine().run();
@@ -48,6 +96,10 @@ public class UCIEngine {
             // Never let an unexpected exception kill the process silently without a trace;
             // print to stderr (not stdout, which is reserved for UCI protocol messages).
             e.printStackTrace();
+        } finally {
+            // EOF is a normal shutdown path for UCI clients. Do not leave a
+            // non-daemon infinite/ponder worker keeping the JVM alive.
+            stopSearchIfRunning(true);
         }
     }
 
@@ -60,6 +112,7 @@ public class UCIEngine {
                 send("id author " + ENGINE_AUTHOR);
                 send("option name Hash type spin default 64 min 1 max 4096");
                 send("option name ProphylaxisProbe type check default true");
+                send("option name Ponder type check default false");
                 send("uciok");
                 break;
             case "isready":
@@ -81,6 +134,9 @@ public class UCIEngine {
                 break;
             case "stop":
                 stopSearchIfRunning(false);
+                break;
+            case "ponderhit":
+                handlePonderHit();
                 break;
             case "setoption":
                 handleSetOption(line);
@@ -182,6 +238,7 @@ public class UCIEngine {
         long movetime = -1, wtime = -1, btime = -1, winc = 0, binc = 0;
         int movestogo = 0;
         boolean infinite = false;
+        boolean ponder = false;
 
         for (int i = 1; i < tokens.length; i++) {
             switch (tokens[i]) {
@@ -193,7 +250,8 @@ public class UCIEngine {
                 case "binc": binc = Long.parseLong(tokens[++i]); break;
                 case "movestogo": movestogo = Integer.parseInt(tokens[++i]); break;
                 case "infinite": infinite = true; break;
-                // "ponder", "nodes", "mate", "searchmoves" accepted but not specially handled in v1
+                case "ponder": ponder = true; break;
+                // "nodes", "mate", and "searchmoves" are accepted but not specially handled in v1.
                 default: break;
             }
         }
@@ -229,34 +287,83 @@ public class UCIEngine {
         for (int i = 0; i < historyArray.length; i++) historyArray[i] = gameHistory.get(i);
 
         final int fDepthLimit = depthLimit;
-        final long fSoftTimeBudget = softTimeBudget;
-        final long fHardTimeBudget = hardTimeBudget;
+        final long fSoftTimeBudget = ponder ? -1 : softTimeBudget;
+        final long fHardTimeBudget = ponder ? -1 : hardTimeBudget;
         final Board searchBoard = new Board();
         searchBoard.setFromFen(board.toFen());
         final Search searchForTask = search;
         searchForTask.clearStopRequestForNextSearch();
         final long[] searchHistory = historyArray;
         final long taskGeneration = searchGeneration;
+        final boolean ponderSearch = ponder;
+        final boolean includePonderMove = ponderOptionEnabled;
+        final PonderControl ponderControl = ponder
+                ? new PonderControl(searchForTask, softTimeBudget, hardTimeBudget) : null;
+        activePonderControl = ponderControl;
+        final String[] latestPv = {""};
 
         searchThread = new Thread(() -> {
-            searchForTask.setInfoListener((infoDepth, selDepth, scoreCp, isMate, mateIn,
-                                           nodes, nps, timeMs, pv) -> {
+            try {
+                searchForTask.setInfoListener((infoDepth, selDepth, scoreCp, isMate, mateIn,
+                                               nodes, nps, timeMs, pv) -> {
+                    if (taskGeneration == searchGeneration) {
+                        latestPv[0] = pv;
+                        printInfo(infoDepth, selDepth, scoreCp, isMate, mateIn,
+                                nodes, nps, timeMs, pv);
+                    }
+                });
+                int best = searchForTask.searchPrepared(searchBoard, fDepthLimit, fSoftTimeBudget,
+                        fHardTimeBudget, searchHistory,
+                        ponderControl == null ? null : ponderControl::timeControlReady);
+                if (ponderSearch) ponderControl.awaitHitOrRelease();
                 if (taskGeneration == searchGeneration) {
-                    printInfo(infoDepth, selDepth, scoreCp, isMate, mateIn,
-                            nodes, nps, timeMs, pv);
+                    send("bestmove " + formatBestMoveWithPonder(
+                            searchBoard, best, latestPv[0], includePonderMove));
                 }
-            });
-            int best = searchForTask.searchPrepared(searchBoard, fDepthLimit, fSoftTimeBudget,
-                    fHardTimeBudget, searchHistory);
-            if (taskGeneration == searchGeneration) {
-                send("bestmove " + formatBestMove(best));
+            } finally {
+                if (activePonderControl == ponderControl) activePonderControl = null;
             }
         }, "search-thread");
         searchThread.start();
     }
 
+    private void handlePonderHit() {
+        PonderControl control = activePonderControl;
+        if (control != null) control.ponderHit();
+    }
+
     static String formatBestMove(int move) {
         return move == Move.NONE ? "0000" : Move.toUci(move);
+    }
+
+    private String formatBestMoveWithPonder(Board root, int bestMove, String pv,
+                                             boolean includePonderMove) {
+        String formatted = formatBestMove(bestMove);
+        if (!includePonderMove || bestMove == Move.NONE) return formatted;
+
+        Board afterBest = new Board();
+        afterBest.setFromFen(root.toFen());
+        if (parseUciMove(afterBest, Move.toUci(bestMove)) == Move.NONE) return formatted;
+        afterBest.makeMove(bestMove);
+
+        int predicted = Move.NONE;
+        String[] pvMoves = pv.trim().isEmpty() ? new String[0] : pv.trim().split("\\s+");
+        if (pvMoves.length >= 2 && pvMoves[0].equals(Move.toUci(bestMove))) {
+            predicted = parseUciMove(afterBest, pvMoves[1]);
+        }
+        if (predicted == Move.NONE) {
+            long entry = tt.probePacked(afterBest.zobristKey);
+            if (entry != 0) {
+                int ttMove = TranspositionTable.moveOf(entry);
+                if (parseUciMove(afterBest, Move.toUci(ttMove)) != Move.NONE) predicted = ttMove;
+            }
+        }
+        if (predicted == Move.NONE) {
+            MoveList replies = new MoveList();
+            MoveGenerator.generateLegal(afterBest, replies);
+            if (replies.size > 0) predicted = replies.get(0);
+        }
+        return predicted == Move.NONE ? formatted : formatted + " ponder " + Move.toUci(predicted);
     }
 
     /**
@@ -265,6 +372,8 @@ public class UCIEngine {
      */
     private void stopSearchIfRunning(boolean suppressBestMove) {
         if (suppressBestMove) searchGeneration++;
+        PonderControl ponderControl = activePonderControl;
+        if (ponderControl != null) ponderControl.release();
         Thread runningThread = searchThread;
         if (runningThread == null || !runningThread.isAlive()) return;
         search.requestStop();
@@ -305,6 +414,9 @@ public class UCIEngine {
             prophylaxisProbeEnabled = value.equalsIgnoreCase("true")
                     || value.equalsIgnoreCase("on") || value.equals("1");
             search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
+        } else if (name.equalsIgnoreCase("Ponder")) {
+            ponderOptionEnabled = value.equalsIgnoreCase("true")
+                    || value.equalsIgnoreCase("on") || value.equals("1");
         }
         // Other options (e.g. Threads) can be added here as the engine grows.
     }
