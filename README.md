@@ -199,8 +199,7 @@ above, and the jpackage `.exe` is the fix.
 
 **Note on strength**: this engine plays *legal, reasonably sensible* chess,
 but it's intentionally simple (see below) — think "solid amateur", not
-"stockfish-competitive". That's the point: it's a foundation, not a finished
-product.
+"stockfish-competitive".
 
 ## What's intentionally simple (i.e. where to improve it)
 
