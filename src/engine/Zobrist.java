@@ -6,6 +6,7 @@ public final class Zobrist {
     private Zobrist() {}
 
     public static final long[][][] PIECE_KEY = new long[2][6][64]; // [color][type][sq]
+    public static final long[][] PAWN_KEY = new long[2][64]; // pawn-only position key
     public static final long[] CASTLE_KEY = new long[4]; // WK, WQ, BK, BQ
     public static final long[] EP_FILE_KEY = new long[8];
     public static final long SIDE_KEY;
@@ -20,5 +21,11 @@ public final class Zobrist {
         for (int i = 0; i < 4; i++) CASTLE_KEY[i] = rnd.nextLong();
         for (int i = 0; i < 8; i++) EP_FILE_KEY[i] = rnd.nextLong();
         SIDE_KEY = rnd.nextLong();
+
+        // Keep the existing full-position Zobrist sequence stable. Pawn keys
+        // are generated afterward for consumers that cache pawn-only terms.
+        for (int c = 0; c < 2; c++)
+            for (int s = 0; s < 64; s++)
+                PAWN_KEY[c][s] = rnd.nextLong();
     }
 }

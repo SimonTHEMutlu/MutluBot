@@ -107,7 +107,13 @@ public final class SearchInstrumentationTest {
         check(disabledStats.maxSelectiveDepth == enabledStats.maxSelectiveDepth,
                 "selective depth must remain accurate when counters are disabled");
         check(!disabledStats.instrumentationEnabled && disabledStats.ttProbes == 0
-                        && disabledStats.legalMovesSearched == 0,
+                        && disabledStats.legalMovesSearched == 0
+                        && disabledStats.nonPvLmrEligibleOpportunities == 0
+                        && disabledStats.nonPvLmrExtraPlyApplications == 0
+                        && disabledStats.nonPvLmrClampEvents == 0
+                        && disabledStats.nonPvLmrReduction1To2 == 0
+                        && disabledStats.nonPvLmrReduction2To3 == 0
+                        && disabledStats.nonPvLmrReduction3To4 == 0,
                 "detailed counters must be zero in disabled mode");
     }
 

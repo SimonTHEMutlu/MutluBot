@@ -10,7 +10,7 @@ import java.util.List;
  * such as SCID vs PC, Arena, or CuteChess talks to over stdin/stdout.
  *
  * Supported commands: uci, isready, ucinewgame, position, go, stop,
- * setoption (Hash, ProphylaxisProbe), quit. Also a couple of small debug extras: "d" prints
+ * setoption (Hash, ProphylaxisProbe, ReverseFutilityPruning), quit. Also a couple of small debug extras: "d" prints
  * the board, "perft N" runs a perft test from the current position.
  */
 public class UCIEngine {
@@ -21,7 +21,8 @@ public class UCIEngine {
     private Board board = new Board();
     private TranspositionTable tt = new TranspositionTable(64); // MB
     private Search search = new Search(tt);
-    private boolean prophylaxisProbeEnabled = true;
+    private boolean prophylaxisProbeEnabled;
+    private boolean reverseFutilityEnabled = true;
     private boolean ponderOptionEnabled;
     private final List<Long> gameHistory = new ArrayList<>();
 
@@ -83,6 +84,7 @@ public class UCIEngine {
         gameHistory.add(board.zobristKey);
         search.setInfoListener(this::printInfo);
         search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
+        search.setReverseFutilityEnabled(reverseFutilityEnabled);
 
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         String line;
@@ -111,7 +113,8 @@ public class UCIEngine {
                 send("id name " + ENGINE_NAME);
                 send("id author " + ENGINE_AUTHOR);
                 send("option name Hash type spin default 64 min 1 max 4096");
-                send("option name ProphylaxisProbe type check default true");
+                send("option name ProphylaxisProbe type check default false");
+                send("option name ReverseFutilityPruning type check default true");
                 send("option name Ponder type check default false");
                 send("uciok");
                 break;
@@ -408,8 +411,15 @@ public class UCIEngine {
                 search = new Search(tt);
                 search.setInfoListener(this::printInfo);
                 search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
+                search.setReverseFutilityEnabled(reverseFutilityEnabled);
             } catch (NumberFormatException ignored) {
             }
+        } else if (name.equalsIgnoreCase("ReverseFutilityPruning")) {
+            reverseFutilityEnabled = value.equalsIgnoreCase("true")
+                    || value.equalsIgnoreCase("on") || value.equals("1");
+            // handleSetOption has joined any active search before mutating its
+            // policy. The setter clears bounds cached under the old policy.
+            search.setReverseFutilityEnabled(reverseFutilityEnabled);
         } else if (name.equalsIgnoreCase("ProphylaxisProbe")) {
             prophylaxisProbeEnabled = value.equalsIgnoreCase("true")
                     || value.equalsIgnoreCase("on") || value.equals("1");

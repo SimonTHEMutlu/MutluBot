@@ -185,30 +185,64 @@ public class MoveGenerator {
     }
 
     public static boolean hasLegalMove(Board b) {
-        MoveList pseudo = new MoveList();
-        generatePseudoLegal(b, pseudo, false);
+        return hasAnyLegalMove(b, new MoveList());
+    }
+
+    /**
+     * Allocation-free existence check using caller-owned storage for pawn and
+     * castling candidates. Pawn, non-king piece, and castling moves use the
+     * same make/check/unmake legality rule as {@link #generateLegal(Board, MoveList)};
+     * adjacent king moves use equivalent occupancy-adjusted attack masks.
+     */
+    public static boolean hasAnyLegalMove(Board b, MoveList scratch) {
+        // Most quiet quiescence positions have an immediate king or pawn
+        // move. Test these cheaply before scanning the remaining piece targets.
+        if (hasLegalKingMove(b) || hasLegalPawnMove(b, scratch)) return true;
         int us = b.sideToMove;
-        for (int i = 0; i < pseudo.size; i++) {
-            int move = pseudo.get(i);
+        int them = Piece.opposite(us);
+        long own = b.occupancy[us];
+        long enemy = b.occupancy[them];
+        long all = b.allOccupancy;
+
+        long pieces = b.pieceBB[us][KNIGHT];
+        while (pieces != 0L) {
+            int from = lsb(pieces);
+            pieces &= pieces - 1;
+            if (hasLegalTarget(b, from, KNIGHT_ATTACKS[from] & ~own, enemy, us)) return true;
+        }
+        pieces = b.pieceBB[us][BISHOP];
+        while (pieces != 0L) {
+            int from = lsb(pieces);
+            pieces &= pieces - 1;
+            if (hasLegalTarget(b, from, bishopAttacks(from, all) & ~own, enemy, us)) return true;
+        }
+        pieces = b.pieceBB[us][ROOK];
+        while (pieces != 0L) {
+            int from = lsb(pieces);
+            pieces &= pieces - 1;
+            if (hasLegalTarget(b, from, rookAttacks(from, all) & ~own, enemy, us)) return true;
+        }
+        pieces = b.pieceBB[us][QUEEN];
+        while (pieces != 0L) {
+            int from = lsb(pieces);
+            pieces &= pieces - 1;
+            if (hasLegalTarget(b, from, queenAttacks(from, all) & ~own, enemy, us)) return true;
+        }
+
+        // Castling is not covered by the adjacent-king prefilter.
+        scratch.clear();
+        generateCastling(b, scratch, us);
+        for (int i = 0; i < scratch.size; i++) {
+            int move = scratch.get(i);
             b.makeMove(move);
-            boolean stillLegal = !b.isInCheck(us);
+            boolean legal = !b.isInCheck(us);
             b.unmakeMove();
-            if (stillLegal) return true;
+            if (legal) return true;
         }
         return false;
     }
 
-    /**
-     * Fast, allocation-free check for a legal adjacent king move. This is a
-     * one-way existence prefilter: false does not rule out castling or moves
-     * by another piece, so callers may still need {@link #hasLegalMove(Board)}.
-     */
-    public static boolean hasLegalKingMove(Board b) {
-        int us = b.sideToMove;
-        int them = Piece.opposite(us);
-        int from = b.kingSquare(us);
-        long targets = KING_ATTACKS[from] & ~b.occupancy[us];
-        long enemy = b.occupancy[them];
+    private static boolean hasLegalTarget(Board b, int from, long targets, long enemy, int us) {
         while (targets != 0L) {
             int to = lsb(targets);
             targets &= targets - 1;
@@ -219,6 +253,44 @@ public class MoveGenerator {
             if (legal) return true;
         }
         return false;
+    }
+
+    /**
+     * Fast, allocation-free check for a legal adjacent king move using the
+     * occupancy and enemy piece masks after the king vacates its source and
+     * captures its target. This does not include castling.
+     */
+    public static boolean hasLegalKingMove(Board b) {
+        int us = b.sideToMove;
+        int from = b.kingSquare(us);
+        long targets = KING_ATTACKS[from] & ~b.occupancy[us];
+        while (targets != 0L) {
+            int to = lsb(targets);
+            targets &= targets - 1;
+            if (!isSquareAttackedAfterKingMove(b, from, to, us)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isSquareAttackedAfterKingMove(Board b, int from, int to, int us) {
+        int them = Piece.opposite(us);
+        long fromBit = 1L << from;
+        long toBit = 1L << to;
+        long captured = (b.occupancy[them] & toBit) != 0L
+                && b.pieceTypeAt(to) != KING ? toBit : 0L;
+        long occupancyAfter = (b.allOccupancy & ~fromBit & ~toBit) | toBit;
+
+        if ((KNIGHT_ATTACKS[to] & (b.pieceBB[them][KNIGHT] & ~captured)) != 0L) return true;
+        // Keep the enemy king in its attack mask, including malformed positions
+        // where a pseudo-legal target overlaps its square.
+        if ((KING_ATTACKS[to] & b.pieceBB[them][KING]) != 0L) return true;
+        if ((PAWN_ATTACKS[Piece.opposite(them)][to]
+                & (b.pieceBB[them][PAWN] & ~captured)) != 0L) return true;
+
+        long rooksQueens = (b.pieceBB[them][ROOK] | b.pieceBB[them][QUEEN]) & ~captured;
+        if ((rookAttacks(to, occupancyAfter) & rooksQueens) != 0L) return true;
+        long bishopsQueens = (b.pieceBB[them][BISHOP] | b.pieceBB[them][QUEEN]) & ~captured;
+        return (bishopAttacks(to, occupancyAfter) & bishopsQueens) != 0L;
     }
 
     /** Fast, allocation-free check for a legal pawn move using caller-owned scratch storage. */

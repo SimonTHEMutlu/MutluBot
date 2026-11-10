@@ -1,0 +1,4 @@
+# Exposed performance/behavioral sentinels, not independently proved best-move gates.
+# Historical depth21 measurements: Hash256; ProphylaxisProbe=false; margin100cp/ply; fresh JVMs.
+id	fen	reference_depth	baseline_move	candidate_move	baseline_score_cp	candidate_score_cp	baseline_nodes	candidate_nodes	notes
+rfp_active_king_rook	8/3r4/1p4kp/p1p3p1/P1P3P1/1P3K1P/8/4R3 b - - 0 42	21	g6g7	d7f7	1	1	38862724	70493140	Synthetic setup-only position; no pre-setup history invented. Rf7+ is legal; no independent proof ranks it below Kg7. Preserve and report the local slowdown; do not tune to this fixture alone.

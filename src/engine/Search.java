@@ -118,11 +118,22 @@ public class Search {
     private static final int MAX_MVV_LVA_SCORE = 40_000;
     private static final int BAD_CAPTURE_SEE_THRESHOLD = -300;
     private static final int SEE_LMR_THRESHOLD = -300;
+    // Exact schedule caps: depth 43 saturates even at rank 6; rank 25
+    // saturates depth 4's depth-clamped result and all results at depth >= 5.
+    private static final int LMR_MAX_DEPTH_INDEX = 43;
+    private static final int LMR_MAX_MOVE_RANK_INDEX = 25;
+    private static final int LMR_TABLE_WIDTH = LMR_MAX_MOVE_RANK_INDEX + 1;
+    private static final byte[] LMR_TABLE = buildLateMoveReductionTable();
+    // Separate non-PV experiment: only deep, sufficiently late quiet moves gain
+    // one extra reduction, leaving early candidates and shallow nodes untouched.
+    static final int NON_PV_LMR_MIN_DEPTH = 6;
+    static final int NON_PV_LMR_MIN_MOVE_RANK = 8;
 
 
     public static final int MAX_PLY = 128;
 
     private final TranspositionTable tt;
+    private final Evaluator.PawnTable pawnTable;
     private final int[][] killerMoves = new int[MAX_PLY][2];
     private final int[][] historyTable = new int[64][64];
     private final int[][] seeGains = new int[MAX_PLY][32];
@@ -153,12 +164,29 @@ public class Search {
     private long lmrFullDepthResearches;
     private long lmrReductionPlies;
     private long lmrDeepReductions;
+    private long nonPvLmrEligibleOpportunities;
+    private long nonPvLmrExtraPlyApplications;
+    private long nonPvLmrClampEvents;
+    private long nonPvLmrReduction1To2;
+    private long nonPvLmrReduction2To3;
+    private long nonPvLmrReduction3To4;
     private long seeCalls;
     private long mainOrderingSeeCalls;
     private long qPruneSeeCalls;
     private long mainSeeDemotions;
     private long nullMoveAttempts;
     private long nullMoveCutoffs;
+    private long rfpEligibilityChecks;
+    private long rfpEligibleNodes;
+    private long rfpStaticEvalCalls;
+    private long rfpCutoffs;
+    private long rfpStalemateGuards;
+    private long rfpEligibleDepth1;
+    private long rfpEligibleDepth2;
+    private long rfpEligibleDepth3;
+    private long rfpCutoffsDepth1;
+    private long rfpCutoffsDepth2;
+    private long rfpCutoffsDepth3;
     private long aspirationRetries;
     private long repetitionExits;
     private long fiftyMoveExits;
@@ -169,6 +197,9 @@ public class Search {
     private volatile boolean timeLimited;
     private boolean rootBishopPreferenceActive;
     private boolean rootDrawClaimed;
+    private boolean nonPvLmrEnabled = true;
+    private boolean reverseFutilityEnabled = true;
+    private int reverseFutilityMarginPerPly = 100;
 
     private int rootBestMove;
     private int iterationBestMove;
@@ -198,6 +229,12 @@ public class Search {
         public final long lmrFullDepthResearches;
         public final long lmrReductionPlies;
         public final long lmrDeepReductions;
+        public final long nonPvLmrEligibleOpportunities;
+        public final long nonPvLmrExtraPlyApplications;
+        public final long nonPvLmrClampEvents;
+        public final long nonPvLmrReduction1To2;
+        public final long nonPvLmrReduction2To3;
+        public final long nonPvLmrReduction3To4;
         public final long seeCalls;
         public final long mainTieBreakSeeCalls;
         /** @deprecated use mainOrderingSeeCalls. */
@@ -207,6 +244,17 @@ public class Search {
         public final long mainSeeDemotions;
         public final long nullMoveAttempts;
         public final long nullMoveCutoffs;
+        public final long rfpEligibilityChecks;
+        public final long rfpEligibleNodes;
+        public final long rfpStaticEvalCalls;
+        public final long rfpCutoffs;
+        public final long rfpStalemateGuards;
+        public final long rfpEligibleDepth1;
+        public final long rfpEligibleDepth2;
+        public final long rfpEligibleDepth3;
+        public final long rfpCutoffsDepth1;
+        public final long rfpCutoffsDepth2;
+        public final long rfpCutoffsDepth3;
         public final long aspirationRetries;
         public final long repetitionExits;
         public final long fiftyMoveExits;
@@ -219,10 +267,20 @@ public class Search {
                             long quiescenceBetaCutoffs, long firstMoveCutoffs,
                             long legalMovesSearched, long lmrAttempts, long lmrReducedSearches,
                             long lmrFullDepthResearches, long lmrReductionPlies,
-                            long lmrDeepReductions, long seeCalls, long mainOrderingSeeCalls,
+                            long lmrDeepReductions, long nonPvLmrEligibleOpportunities,
+                            long nonPvLmrExtraPlyApplications, long nonPvLmrClampEvents,
+                            long nonPvLmrReduction1To2, long nonPvLmrReduction2To3,
+                            long nonPvLmrReduction3To4,
+                            long seeCalls, long mainOrderingSeeCalls,
                             long qPruneSeeCalls, long mainSeeDemotions, long nullMoveAttempts,
-                            long nullMoveCutoffs, long aspirationRetries, long repetitionExits,
-                            long fiftyMoveExits, boolean instrumentationEnabled) {
+                            long nullMoveCutoffs, long rfpEligibilityChecks,
+                            long rfpEligibleNodes, long rfpStaticEvalCalls, long rfpCutoffs,
+                            long rfpStalemateGuards, long rfpEligibleDepth1,
+                            long rfpEligibleDepth2, long rfpEligibleDepth3,
+                            long rfpCutoffsDepth1, long rfpCutoffsDepth2,
+                            long rfpCutoffsDepth3, long aspirationRetries,
+                            long repetitionExits, long fiftyMoveExits,
+                            boolean instrumentationEnabled) {
             this.totalNodes = totalNodes;
             this.mainSearchNodes = mainSearchNodes;
             this.quiescenceNodes = quiescenceNodes;
@@ -243,6 +301,12 @@ public class Search {
             this.lmrFullDepthResearches = lmrFullDepthResearches;
             this.lmrReductionPlies = lmrReductionPlies;
             this.lmrDeepReductions = lmrDeepReductions;
+            this.nonPvLmrEligibleOpportunities = nonPvLmrEligibleOpportunities;
+            this.nonPvLmrExtraPlyApplications = nonPvLmrExtraPlyApplications;
+            this.nonPvLmrClampEvents = nonPvLmrClampEvents;
+            this.nonPvLmrReduction1To2 = nonPvLmrReduction1To2;
+            this.nonPvLmrReduction2To3 = nonPvLmrReduction2To3;
+            this.nonPvLmrReduction3To4 = nonPvLmrReduction3To4;
             this.seeCalls = seeCalls;
             this.mainTieBreakSeeCalls = mainOrderingSeeCalls;
             this.mainOrderSeeCalls = mainOrderingSeeCalls;
@@ -251,6 +315,17 @@ public class Search {
             this.mainSeeDemotions = mainSeeDemotions;
             this.nullMoveAttempts = nullMoveAttempts;
             this.nullMoveCutoffs = nullMoveCutoffs;
+            this.rfpEligibilityChecks = rfpEligibilityChecks;
+            this.rfpEligibleNodes = rfpEligibleNodes;
+            this.rfpStaticEvalCalls = rfpStaticEvalCalls;
+            this.rfpCutoffs = rfpCutoffs;
+            this.rfpStalemateGuards = rfpStalemateGuards;
+            this.rfpEligibleDepth1 = rfpEligibleDepth1;
+            this.rfpEligibleDepth2 = rfpEligibleDepth2;
+            this.rfpEligibleDepth3 = rfpEligibleDepth3;
+            this.rfpCutoffsDepth1 = rfpCutoffsDepth1;
+            this.rfpCutoffsDepth2 = rfpCutoffsDepth2;
+            this.rfpCutoffsDepth3 = rfpCutoffsDepth3;
             this.aspirationRetries = aspirationRetries;
             this.repetitionExits = repetitionExits;
             this.fiftyMoveExits = fiftyMoveExits;
@@ -258,8 +333,12 @@ public class Search {
         }
 
         private static SearchStats empty() {
-            return new SearchStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+            return new SearchStats(
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, false);
         }
 
         private static SearchStats capture(Search search) {
@@ -283,12 +362,29 @@ public class Search {
                     enabled ? search.lmrFullDepthResearches : 0,
                     enabled ? search.lmrReductionPlies : 0,
                     enabled ? search.lmrDeepReductions : 0,
+                    enabled ? search.nonPvLmrEligibleOpportunities : 0,
+                    enabled ? search.nonPvLmrExtraPlyApplications : 0,
+                    enabled ? search.nonPvLmrClampEvents : 0,
+                    enabled ? search.nonPvLmrReduction1To2 : 0,
+                    enabled ? search.nonPvLmrReduction2To3 : 0,
+                    enabled ? search.nonPvLmrReduction3To4 : 0,
                     enabled ? search.seeCalls : 0,
                     enabled ? search.mainOrderingSeeCalls : 0,
                     enabled ? search.qPruneSeeCalls : 0,
                     enabled ? search.mainSeeDemotions : 0,
                     enabled ? search.nullMoveAttempts : 0,
                     enabled ? search.nullMoveCutoffs : 0,
+                    enabled ? search.rfpEligibilityChecks : 0,
+                    enabled ? search.rfpEligibleNodes : 0,
+                    enabled ? search.rfpStaticEvalCalls : 0,
+                    enabled ? search.rfpCutoffs : 0,
+                    enabled ? search.rfpStalemateGuards : 0,
+                    enabled ? search.rfpEligibleDepth1 : 0,
+                    enabled ? search.rfpEligibleDepth2 : 0,
+                    enabled ? search.rfpEligibleDepth3 : 0,
+                    enabled ? search.rfpCutoffsDepth1 : 0,
+                    enabled ? search.rfpCutoffsDepth2 : 0,
+                    enabled ? search.rfpCutoffsDepth3 : 0,
                     enabled ? search.aspirationRetries : 0,
                     enabled ? search.repetitionExits : 0,
                     enabled ? search.fiftyMoveExits : 0,
@@ -316,12 +412,29 @@ public class Search {
                     + " lmrResearch=" + lmrFullDepthResearches
                     + " lmrReductionPlies=" + lmrReductionPlies
                     + " lmrDeep=" + lmrDeepReductions
+                    + " nonPvLmrOpportunities=" + nonPvLmrEligibleOpportunities
+                    + " nonPvLmrExtraPly=" + nonPvLmrExtraPlyApplications
+                    + " nonPvLmrClamped=" + nonPvLmrClampEvents
+                    + " nonPvLmr1to2=" + nonPvLmrReduction1To2
+                    + " nonPvLmr2to3=" + nonPvLmrReduction2To3
+                    + " nonPvLmr3to4=" + nonPvLmrReduction3To4
                     + " seeCalls=" + seeCalls
                     + " mainOrderSeeCalls=" + mainOrderingSeeCalls
                     + " qSeePruneCalls=" + qPruneSeeCalls
                     + " mainSeeDemotions=" + mainSeeDemotions
                     + " nullAttempts=" + nullMoveAttempts
                     + " nullCutoffs=" + nullMoveCutoffs
+                    + " rfpChecks=" + rfpEligibilityChecks
+                    + " rfpEligible=" + rfpEligibleNodes
+                    + " rfpEvalCalls=" + rfpStaticEvalCalls
+                    + " rfpCutoffs=" + rfpCutoffs
+                    + " rfpStalemateGuards=" + rfpStalemateGuards
+                    + " rfpEligibleD1=" + rfpEligibleDepth1
+                    + " rfpEligibleD2=" + rfpEligibleDepth2
+                    + " rfpEligibleD3=" + rfpEligibleDepth3
+                    + " rfpCutoffsD1=" + rfpCutoffsDepth1
+                    + " rfpCutoffsD2=" + rfpCutoffsDepth2
+                    + " rfpCutoffsD3=" + rfpCutoffsDepth3
                     + " aspirationRetries=" + aspirationRetries
                     + " repetitionExits=" + repetitionExits
                     + " fiftyMoveExits=" + fiftyMoveExits;
@@ -351,6 +464,7 @@ public class Search {
     private final int[] prophylaxisPendingMoves = new int[PROPHYLAXIS_MAX_PENDING_ALTERNATIVES];
     private final int[] prophylaxisPendingScores = new int[PROPHYLAXIS_MAX_PENDING_ALTERNATIVES];
     private final MoveList[] prophylaxisMoveLists = new MoveList[3];
+    private final MoveList prophylaxisLegalityScratch = new MoveList();
     private final int[][] prophylaxisOrderedMoves = new int[3][PROPHYLAXIS_FIRST_MOVE_LIMIT];
     private final int[][] prophylaxisOrderedScores = new int[3][PROPHYLAXIS_FIRST_MOVE_LIMIT];
     private final int[][] prophylaxisOrderedLeafScores = new int[3][PROPHYLAXIS_FIRST_MOVE_LIMIT];
@@ -367,7 +481,12 @@ public class Search {
     private boolean prophylaxisBaselineReady;
 
     public Search(TranspositionTable tt) {
+        this(tt, Evaluator.DEFAULT_PAWN_TABLE_CAPACITY);
+    }
+
+    Search(TranspositionTable tt, int pawnTableCapacity) {
         this.tt = tt;
+        this.pawnTable = new Evaluator.PawnTable(pawnTableCapacity);
         for (int ply = 0; ply < MAX_PLY; ply++) {
             moveLists[ply] = new MoveList();
         }
@@ -375,6 +494,13 @@ public class Search {
             prophylaxisMoveLists[i] = new MoveList();
         }
     }
+
+    void clearPawnTable() { pawnTable.clear(); }
+    void setPawnCacheEnabled(boolean enabled) { pawnTable.setEnabled(enabled); }
+    void setPawnCacheInstrumentationEnabled(boolean enabled) {
+        pawnTable.setInstrumentationEnabled(enabled);
+    }
+    Evaluator.PawnCacheStats pawnCacheStats() { return pawnTable.stats(); }
 
     public void setInfoListener(InfoListener l) {
         this.listener = l;
@@ -401,6 +527,47 @@ public class Search {
 
     void setLmrEnabledForTesting(boolean enabled) {
         lmrEnabled = enabled;
+    }
+
+    void setNonPvLmrEnabledForTesting(boolean enabled) {
+        nonPvLmrEnabled = enabled;
+    }
+
+    /**
+     * Enables the game-test-positive RFP feature (default true, 100 cp/ply).
+     * Call only while this Search is idle; UCI stops and joins before changing it.
+     * Discard TT bounds from the previous policy so disabling is effective.
+     */
+    public void setReverseFutilityEnabled(boolean enabled) {
+        if (reverseFutilityEnabled != enabled) {
+            tt.clear();
+            reverseFutilityEnabled = enabled;
+        }
+    }
+
+    public boolean isReverseFutilityEnabled() {
+        return reverseFutilityEnabled;
+    }
+
+    void setReverseFutilityEnabledForTesting(boolean enabled) {
+        setReverseFutilityEnabled(enabled);
+    }
+
+    /** The only predeclared development margins are 100, 125, and 150 cp/ply. */
+    void setReverseFutilityMarginForTesting(int marginPerPly) {
+        if (marginPerPly != 100 && marginPerPly != 125 && marginPerPly != 150) {
+            throw new IllegalArgumentException("RFP margin must be 100, 125, or 150 cp/ply");
+        }
+        reverseFutilityMarginPerPly = marginPerPly;
+    }
+
+    int adjustNonPvLmrReductionForTesting(boolean pvNode, int move, int depth,
+                                          int moveRank, int reduction) {
+        return adjustNonPvLmrReduction(pvNode, move, depth, moveRank, reduction);
+    }
+
+    static boolean isPvNodeForTesting(int alpha, int beta) {
+        return isPvNode(alpha, beta);
     }
 
     void setRootCandidateListener(RootCandidateListener listener) {
@@ -506,12 +673,29 @@ public class Search {
         lmrFullDepthResearches = 0;
         lmrReductionPlies = 0;
         lmrDeepReductions = 0;
+        nonPvLmrEligibleOpportunities = 0;
+        nonPvLmrExtraPlyApplications = 0;
+        nonPvLmrClampEvents = 0;
+        nonPvLmrReduction1To2 = 0;
+        nonPvLmrReduction2To3 = 0;
+        nonPvLmrReduction3To4 = 0;
         seeCalls = 0;
         mainOrderingSeeCalls = 0;
         qPruneSeeCalls = 0;
         mainSeeDemotions = 0;
         nullMoveAttempts = 0;
         nullMoveCutoffs = 0;
+        rfpEligibilityChecks = 0;
+        rfpEligibleNodes = 0;
+        rfpStaticEvalCalls = 0;
+        rfpCutoffs = 0;
+        rfpStalemateGuards = 0;
+        rfpEligibleDepth1 = 0;
+        rfpEligibleDepth2 = 0;
+        rfpEligibleDepth3 = 0;
+        rfpCutoffsDepth1 = 0;
+        rfpCutoffsDepth2 = 0;
+        rfpCutoffsDepth3 = 0;
         aspirationRetries = 0;
         repetitionExits = 0;
         fiftyMoveExits = 0;
@@ -702,6 +886,7 @@ public class Search {
                 long entry = tt.probePacked(board.zobristKey);
                 int requiredDepth = Math.max(1, maxLen - i);
                 if (entry == 0 || !tt.isCurrentGeneration(entry)
+                        || TranspositionTable.halfmoveClockOf(entry) != board.halfmoveClock
                         || TranspositionTable.flagOf(entry) != TranspositionTable.EXACT
                         || TranspositionTable.depthOf(entry) < requiredDepth) break;
                 move = TranspositionTable.moveOf(entry);
@@ -744,6 +929,61 @@ public class Search {
               | b.pieceBB[color][ROOK] | b.pieceBB[color][QUEEN]) != 0;
     }
 
+    private boolean isReverseFutilityEligible(Board board, int depth, int searchPly,
+                                               boolean pvNode, boolean inCheck,
+                                               boolean nullOk, boolean repetitionSensitive,
+                                               int originalAlpha, int originalBeta) {
+        return depth >= 1 && depth <= 3
+                && searchPly > 0
+                && !pvNode
+                && !inCheck
+                && nullOk
+                && !repetitionSensitive
+                && originalAlpha < originalBeta
+                && Math.abs(originalAlpha) < MATE_SCORE - MAX_PLY
+                && Math.abs(originalBeta) < MATE_SCORE - MAX_PLY
+                && board.halfmoveClock + depth < 100
+                && hasRfpSafeMaterial(board);
+    }
+
+    boolean isReverseFutilityEligibleForTesting(Board board, int depth, int searchPly,
+                                                 boolean pvNode, boolean inCheck,
+                                                 boolean nullOk, boolean repetitionSensitive,
+                                                 int alpha, int beta) {
+        return isReverseFutilityEligible(board, depth, searchPly, pvNode, inCheck,
+                nullOk, repetitionSensitive, alpha, beta);
+    }
+
+    private boolean hasRfpSafeMaterial(Board board) {
+        int us = board.sideToMove;
+        int them = opposite(us);
+        if (!hasNonPawnMaterial(board, us) || !hasNonPawnMaterial(board, them)) return false;
+        long ownMajor = board.pieceBB[us][ROOK] | board.pieceBB[us][QUEEN];
+        int ownMinors = Long.bitCount(board.pieceBB[us][KNIGHT])
+                + Long.bitCount(board.pieceBB[us][BISHOP]);
+        return ownMajor != 0L || ownMinors >= 2;
+    }
+
+    private boolean hasAnyLegalMoveForRfp(Board board, int searchPly) {
+        return MoveGenerator.hasAnyLegalMove(board, moveLists[searchPly]);
+    }
+
+    boolean hasAnyLegalMoveForRfpTesting(Board board, int searchPly) {
+        return hasAnyLegalMoveForRfp(board, searchPly);
+    }
+
+    private void countRfpEligibleDepth(int depth) {
+        if (depth == 1) rfpEligibleDepth1++;
+        else if (depth == 2) rfpEligibleDepth2++;
+        else if (depth == 3) rfpEligibleDepth3++;
+    }
+
+    private void countRfpCutoffDepth(int depth) {
+        if (depth == 1) rfpCutoffsDepth1++;
+        else if (depth == 2) rfpCutoffsDepth2++;
+        else if (depth == 3) rfpCutoffsDepth3++;
+    }
+
     private int adjustMateToTT(int score, int searchPly) {
         if (score >= MATE_SCORE - MAX_PLY) return score + searchPly;
         if (score <= -(MATE_SCORE - MAX_PLY)) return score - searchPly;
@@ -776,14 +1016,14 @@ public class Search {
 
         if (searchPly >= MAX_PLY - 1) {
             if (instrumentationEnabled) evaluatorCalls++;
-            return Evaluator.evaluate(board);
+            return Evaluator.evaluate(board, pawnTable);
         }
 
         int absPly = historyBase + searchPly;
         keyStack[absPly] = board.zobristKey;
         if (board.halfmoveClock >= 100) {
             boolean checked = board.isInCheck(board.sideToMove);
-            if (!checked || MoveGenerator.hasLegalMove(board)) {
+            if (!checked || MoveGenerator.hasAnyLegalMove(board, moveLists[searchPly])) {
                 if (searchPly == 0) rootDrawClaimed = true;
                 if (instrumentationEnabled) fiftyMoveExits++;
                 return 0;
@@ -810,8 +1050,13 @@ public class Search {
             else return quiescence(board, alpha, beta, searchPly);
         }
 
+        // Capture the original window's node type before TT bounds can narrow
+        // either side and make a PV node look like a null-window node.
+        boolean pvNode = isPvNode(alpha, beta);
         int origAlpha = alpha;
+        int origBeta = beta;
         int ttMove = Move.NONE;
+        boolean ttNarrowedBeta = false;
         if (instrumentationEnabled) ttProbes++;
         long entry = tt.probePacked(board.zobristKey);
         if (entry != 0) {
@@ -829,6 +1074,7 @@ public class Search {
             // history or active line. The move remains useful for ordering.
             if (usableRootTtMove && !(searchPly == 0 && rootBishopPreferenceActive)
                     && !repetitionSensitive && tt.isCurrentGeneration(entry)
+                    && TranspositionTable.halfmoveClockOf(entry) == board.halfmoveClock
                     && TranspositionTable.depthOf(entry) >= depth) {
                 int score = adjustMateFromTT(TranspositionTable.scoreOf(entry), searchPly);
                 int flag = TranspositionTable.flagOf(entry);
@@ -838,7 +1084,10 @@ public class Search {
                     return score;
                 }
                 if (flag == TranspositionTable.LOWER_BOUND && score > alpha) alpha = score;
-                else if (flag == TranspositionTable.UPPER_BOUND && score < beta) beta = score;
+                else if (flag == TranspositionTable.UPPER_BOUND && score < beta) {
+                    beta = score;
+                    ttNarrowedBeta = true;
+                }
                 if (alpha >= beta) {
                     if (instrumentationEnabled) ttBoundCutoffs++;
                     if (searchPly == 0) iterationBestMove = ttMove;
@@ -857,6 +1106,42 @@ public class Search {
             if (score >= beta) {
                 if (instrumentationEnabled) nullMoveCutoffs++;
                 return beta;
+            }
+        }
+
+        if (!stopRequested && reverseFutilityEnabled && !ttNarrowedBeta) {
+            if (instrumentationEnabled) rfpEligibilityChecks++;
+            boolean rfpEligible = isReverseFutilityEligible(board, depth, searchPly, pvNode,
+                    inCheck, nullOk, repetitionSensitive, origAlpha, origBeta);
+            if (stopRequested) return 0;
+            if (rfpEligible) {
+                if (instrumentationEnabled) {
+                    rfpEligibleNodes++;
+                    countRfpEligibleDepth(depth);
+                    rfpStaticEvalCalls++;
+                    evaluatorCalls++;
+                }
+                int staticEval = Evaluator.evaluate(board, pawnTable);
+                if (stopRequested) return 0;
+                int margin = depth * reverseFutilityMarginPerPly;
+                if (staticEval >= origBeta + margin) {
+                    // RFP must not make stalemate look like a fail-high. The
+                    // existence probe runs only after the score has qualified.
+                    boolean hasLegalMove = hasAnyLegalMoveForRfp(board, searchPly);
+                    if (stopRequested) return 0;
+                    if (!hasLegalMove) {
+                        if (instrumentationEnabled) rfpStalemateGuards++;
+                        return 0;
+                    }
+                    if (instrumentationEnabled) {
+                        rfpCutoffs++;
+                        countRfpCutoffDepth(depth);
+                    }
+                    // Fail hard at the current beta. RFP is skipped whenever a
+                    // usable TT upper bound narrowed beta, so this cutoff cannot
+                    // contradict an already-applied upper bound.
+                    return beta;
+                }
             }
         }
 
@@ -905,12 +1190,25 @@ public class Search {
                 childRepetitionTainted = repetitionTainted[searchPly + 1];
                 candidateSearchExact = score > alpha && score < beta;
             } else {
-                boolean givesCheck = board.isInCheck(board.sideToMove);
-                boolean advancedPasser = isAdvancedPassedPawnPush(board, move, us);
-                int reduction = bishopBonus > 0 ? 0
-                        : lmrReductionForMove(move, depth, legalCount, searchPly,
-                                ttMove, inCheck, givesCheck, advancedPasser, board, us,
-                                captureSeeFromScore(scores[i]));
+                int baseReduction = bishopBonus > 0 ? 0
+                        : lmrBaseReductionForMove(move, depth, legalCount, searchPly,
+                                ttMove, inCheck, captureSeeFromScore(scores[i]));
+                int reduction = 0;
+                if (baseReduction > 0) {
+                    if (!board.isInCheck(board.sideToMove)) {
+                        boolean pawnMove = board.pieceTypeAt(Move.to(move)) == PAWN;
+                        boolean advancedPasser = pawnMove
+                                && isAdvancedPassedPawnPush(board, move, us);
+                        boolean nearRootPawnOffer = pawnMove && searchPly <= 1
+                                && !Move.isCapture(move) && !Move.isPromotion(move)
+                                && isNearRootPawnOffer(board, move, us, searchPly);
+                        if (!advancedPasser && !nearRootPawnOffer) reduction = baseReduction;
+                    }
+                }
+                if (reduction > 0) {
+                    reduction = adjustNonPvLmrReduction(
+                            pvNode, move, depth, legalCount, reduction);
+                }
                 if (reduction > 0) {
                     if (instrumentationEnabled) {
                         lmrAttempts++;
@@ -1025,7 +1323,8 @@ public class Search {
         else if (bestScore >= beta) flag = TranspositionTable.LOWER_BOUND;
         else flag = TranspositionTable.EXACT;
         if (!repetitionTainted[searchPly]) {
-            tt.store(board.zobristKey, depth, adjustMateToTT(bestScore, searchPly), flag, bestMove);
+            tt.store(board.zobristKey, depth, adjustMateToTT(bestScore, searchPly), flag, bestMove,
+                    board.halfmoveClock);
         }
         if (searchPly == 0) {
             int selectedProbe = rootExact && !stopRequested
@@ -1471,7 +1770,7 @@ public class Search {
                                     if (board.isInCheck(attacker)
                                             || !consumeProphylaxisEvaluation(maxEvaluations,
                                                     startEvaluations)) continue;
-                                    int score = Evaluator.evaluate(board);
+                                    int score = Evaluator.evaluate(board, pawnTable);
                                     prophylaxisLeaves++;
                                     leaves++;
                                     String line = "CHECK " + Move.toUci(first) + " "
@@ -1514,7 +1813,7 @@ public class Search {
                     continue;
                 }
 
-                if (!MoveGenerator.hasLegalMove(board)) continue; // stalemate
+                if (!MoveGenerator.hasAnyLegalMove(board, prophylaxisLegalityScratch)) continue; // stalemate
                 board.makeNullMove();
                 try {
                     // The pass represents a hypothetical missed defensive
@@ -1547,7 +1846,7 @@ public class Search {
                             if (board.isInCheck(attacker)
                                     || !consumeProphylaxisEvaluation(maxEvaluations,
                                             startEvaluations)) continue;
-                            int score = Evaluator.evaluate(board);
+                            int score = Evaluator.evaluate(board, pawnTable);
                             prophylaxisLeaves++;
                             leaves++;
                             String line = "PASS " + Move.toUci(first) + " "
@@ -1622,7 +1921,7 @@ public class Search {
                 board.makeMove(move);
                 try {
                     if (board.isInCheck(moverColor)) continue;
-                    int eval = Evaluator.evaluate(board);
+                    int eval = Evaluator.evaluate(board, pawnTable);
                     prophylaxisEvaluations++;
                     prophylaxisOrderingEvaluations++;
                     leafScores[i] = eval;
@@ -1737,6 +2036,25 @@ public class Search {
      * effort on the highest-ranked candidates.
      */
     static int lateMoveReduction(int depth, int moveRank) {
+        int depthIndex = depth <= 0 ? 0 : Math.min(depth, LMR_MAX_DEPTH_INDEX);
+        int moveRankIndex = moveRank <= 0 ? 0
+                : Math.min(moveRank, LMR_MAX_MOVE_RANK_INDEX);
+        return LMR_TABLE[depthIndex * LMR_TABLE_WIDTH + moveRankIndex] & 0xff;
+    }
+
+    private static byte[] buildLateMoveReductionTable() {
+        byte[] table = new byte[(LMR_MAX_DEPTH_INDEX + 1) * LMR_TABLE_WIDTH];
+        for (int depth = 0; depth <= LMR_MAX_DEPTH_INDEX; depth++) {
+            for (int moveRank = 0; moveRank <= LMR_MAX_MOVE_RANK_INDEX; moveRank++) {
+                table[depth * LMR_TABLE_WIDTH + moveRank] =
+                        (byte) lateMoveReductionFormula(depth, moveRank);
+            }
+        }
+        return table;
+    }
+
+    /** Arithmetic reference for the table-equivalence test. */
+    static int lateMoveReductionFormula(int depth, int moveRank) {
         if (depth < 3 || moveRank <= 4) return 0;
         int reduction = 1;
         if (depth >= 4 && moveRank >= 6) {
@@ -1744,6 +2062,44 @@ public class Search {
             reduction += Math.min(2, extra);
         }
         return Math.min(reduction, Math.max(0, depth - 2));
+    }
+
+    private static boolean isPvNode(int alpha, int beta) {
+        return beta - alpha > 1;
+    }
+
+    private int adjustNonPvLmrReduction(boolean pvNode, int move, int depth,
+                                        int moveRank, int reduction) {
+        if (pvNode || Move.isCapture(move) || Move.isPromotion(move)
+                || depth < NON_PV_LMR_MIN_DEPTH
+                || moveRank < NON_PV_LMR_MIN_MOVE_RANK || reduction <= 0) return reduction;
+        if (instrumentationEnabled) nonPvLmrEligibleOpportunities++;
+        if (!nonPvLmrEnabled) return reduction;
+        int maximum = Math.max(0, depth - 2);
+        int adjusted = Math.min(maximum, reduction + 1);
+        if (adjusted == reduction) {
+            if (instrumentationEnabled) nonPvLmrClampEvents++;
+            return reduction;
+        }
+        if (instrumentationEnabled) {
+            nonPvLmrExtraPlyApplications++;
+            if (reduction == 1 && adjusted == 2) nonPvLmrReduction1To2++;
+            else if (reduction == 2 && adjusted == 3) nonPvLmrReduction2To3++;
+            else if (reduction == 3 && adjusted == 4) nonPvLmrReduction3To4++;
+        }
+        return adjusted;
+    }
+
+    /** Returns the depth/rank reduction after only move-local, inexpensive guards. */
+    int lmrBaseReductionForMove(int move, int depth, int moveRank, int searchPly,
+                                int ttMove, boolean inCheck, int captureSee) {
+        int reduction = lateMoveReduction(depth, moveRank);
+        if (reduction == 0 || !lmrEnabled || inCheck || searchPly < 0
+                || searchPly >= MAX_PLY || Move.isPromotion(move) || move == ttMove
+                || move == killerMoves[searchPly][0] || move == killerMoves[searchPly][1]) return 0;
+        if (Move.isCapture(move)
+                && (Move.isEnPassant(move) || captureSee > SEE_LMR_THRESHOLD)) return 0;
+        return reduction;
     }
 
     int lmrReductionForMove(int move, int depth, int moveRank, int searchPly,
@@ -1828,7 +2184,7 @@ public class Search {
 
         if (searchPly >= MAX_PLY - 1) {
             if (instrumentationEnabled) evaluatorCalls++;
-            return Evaluator.evaluate(board);
+            return Evaluator.evaluate(board, pawnTable);
         }
 
         if (keyStack != null) {
@@ -1853,11 +2209,9 @@ public class Search {
             // Quiescence can be entered immediately after a move that leaves
             // the opponent with no legal moves. Without this terminal check,
             // a stalemate at the horizon is incorrectly scored by stand-pat.
-            if (!MoveGenerator.hasLegalKingMove(board)
-                    && !MoveGenerator.hasLegalPawnMove(board, moveLists[searchPly])
-                    && !MoveGenerator.hasLegalMove(board)) return 0;
+            if (!MoveGenerator.hasAnyLegalMove(board, moveLists[searchPly])) return 0;
             if (instrumentationEnabled) evaluatorCalls++;
-            standPat = Evaluator.evaluate(board);
+            standPat = Evaluator.evaluate(board, pawnTable);
             if (standPat >= beta) {
                 if (instrumentationEnabled) quiescenceBetaCutoffs++;
                 return beta;
@@ -1992,11 +2346,7 @@ public class Search {
                 seeCalls++;
                 mainOrderingSeeCalls++;
             }
-            if (rootBishopPreferenceActive) {
-                // Keep all capture sub-stages unchanged throughout this
-                // root-preference search, not only the placement of losers.
-                scores[bestIdx] = GOOD_CAPTURE_SCORE + mvvLva(board, move);
-            } else if (see > BAD_CAPTURE_SEE_THRESHOLD) {
+            if (see > BAD_CAPTURE_SEE_THRESHOLD) {
                 scores[bestIdx] = GOOD_CAPTURE_SCORE + mvvLva(board, move);
             } else {
                 int cachedSee = Math.max(-MAX_MVV_LVA_SCORE,

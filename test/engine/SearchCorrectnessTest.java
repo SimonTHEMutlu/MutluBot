@@ -12,6 +12,8 @@ public final class SearchCorrectnessTest {
     public static void main(String[] args) {
         testQuiescenceRecognizesCheckmate();
         testQuiescenceRecognizesStalemate();
+        testAllocationFreeAnyLegalMoveMatchesLegalGeneration();
+        testKingMoveMaskMatchesLegalGeneration();
         testLegalKingMovePrefilter();
         testQuiescenceSearchesQuietCheckEvasions();
         testQuiescenceSearchesQuietPromotions();
@@ -69,6 +71,82 @@ public final class SearchCorrectnessTest {
         check(!MoveGenerator.hasLegalPawnMove(board, new MoveList()),
                 "pinned pawn moves that expose the king must not pass the prefilter");
         check(before.equals(board.toFen()), "pinned pawn prefilter must restore the board");
+    }
+
+    private static void testAllocationFreeAnyLegalMoveMatchesLegalGeneration() {
+        assertAnyLegalMoveMatches("checkmate", "7k/6Q1/6K1/8/8/8/8/8 b - - 0 1", false);
+        assertAnyLegalMoveMatches("stalemate", "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", false);
+        assertAnyLegalMoveMatches("stalemate with pinned pawn", "7k/5Qp1/8/4B3/4B3/8/8/K7 b - - 0 1", false);
+        assertAnyLegalMoveMatches("quiet check evasion", "7k/8/8/7R/8/8/8/K7 b - - 0 1", true);
+        assertAnyLegalMoveMatches("castling", "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", true);
+        assertAnyLegalMoveMatches("promotion", "7k/P7/8/8/8/8/8/7K w - - 0 1", true);
+        assertAnyLegalMoveMatches("legal en passant", "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", true);
+        assertAnyLegalMoveMatches("pinned en passant", "4k3/8/8/r4PpK/8/8/8/8 w - g6 0 1", true);
+        assertAnyLegalMoveMatches("pinned piece", "k7/8/8/8/8/8/4r3/4K2R w K - 0 1", true);
+        check(hasLegalUci("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "e5d6"),
+                "legal en passant capture must remain available");
+        check(!hasLegalUci("4k3/8/8/r4PpK/8/8/8/8 w - g6 0 1", "f5g6"),
+                "en passant that exposes the king must remain illegal");
+        check(hasLegalUci("7k/P7/8/8/8/8/8/7K w - - 0 1", "a7a8q"),
+                "promotion must remain available to legal-move detection");
+        check(hasLegalUci("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1"),
+                "legal castling must remain available");
+    }
+
+    private static void assertAnyLegalMoveMatches(String label, String fen, boolean expected) {
+        Board board = board(fen);
+        String before = board.toFen();
+        MoveList legal = new MoveList();
+        MoveGenerator.generateLegal(board, legal);
+        boolean reference = legal.size != 0;
+        check(reference == expected, label + " fixture must have expected legal-move state");
+        MoveList scratch = new MoveList();
+        check(MoveGenerator.hasAnyLegalMove(board, scratch) == reference,
+                "allocation-free legal-move check disagrees with full generation: " + label);
+        check(before.equals(board.toFen()), "legal-move check must restore board: " + label);
+    }
+
+    private static boolean hasLegalUci(String fen, String uci) {
+        Board board = board(fen);
+        MoveList legal = new MoveList();
+        MoveGenerator.generateLegal(board, legal);
+        for (int i = 0; i < legal.size; i++) {
+            if (Move.toUci(legal.get(i)).equals(uci)) return true;
+        }
+        return false;
+    }
+
+    private static void testKingMoveMaskMatchesLegalGeneration() {
+        String undefendedCapture = "k7/8/8/4p3/4K3/8/8/8 w - - 0 1";
+        String defendedCapture = "k3r3/8/8/4p3/4K3/8/8/8 w - - 0 1";
+        String discoveredRookAttack = "4k3/8/8/8/4K3/8/4r3/8 w - - 0 1";
+        assertKingMoveProbeMatches(undefendedCapture);
+        assertKingMoveProbeMatches(defendedCapture);
+        assertKingMoveProbeMatches(discoveredRookAttack);
+        check(hasLegalUci(undefendedCapture, "e4e5"),
+                "king must be able to capture an undefended adjacent piece");
+        check(!hasLegalUci(defendedCapture, "e4e5"),
+                "king must not capture an adjacent piece defended by a rook");
+        check(!hasLegalUci(discoveredRookAttack, "e4e5"),
+                "king must not move into a rook ray uncovered by vacating its source");
+    }
+
+    private static void assertKingMoveProbeMatches(String fen) {
+        Board board = board(fen);
+        String before = board.toFen();
+        MoveList legal = new MoveList();
+        MoveGenerator.generateLegal(board, legal);
+        boolean hasLegalAdjacentKingMove = false;
+        for (int i = 0; i < legal.size; i++) {
+            int move = legal.get(i);
+            if (board.pieceTypeAt(Move.from(move)) == Piece.KING && !Move.isCastle(move)) {
+                hasLegalAdjacentKingMove = true;
+                break;
+            }
+        }
+        check(MoveGenerator.hasLegalKingMove(board) == hasLegalAdjacentKingMove,
+                "king attack-mask probe disagrees with legal generation in " + fen);
+        check(before.equals(board.toFen()), "king attack-mask probe must preserve board");
     }
 
     private static void testQuiescenceSearchesQuietCheckEvasions() {
@@ -223,7 +301,7 @@ public final class SearchCorrectnessTest {
 
         TranspositionTable shared = new TranspositionTable(16);
         shared.store(position.board.zobristKey, 12, 553,
-                TranspositionTable.EXACT, drawingMove); // poison from the earlier root
+                TranspositionTable.EXACT, drawingMove, position.board.halfmoveClock); // earlier root
         SearchResult result = search(position.board, position.keys, shared, 12);
         String bestMove = Move.toUci(result.move);
         check(!bestMove.equals("g1g3"),

@@ -18,7 +18,19 @@ public class Board {
     public int epSquare; // -1 if none
     public int halfmoveClock;
     public int fullmoveNumber;
+    // Canonical position identity for repetition: an EP file contributes only
+    // when at least one legal EP capture exists. epSquare still preserves FEN.
     public long zobristKey;
+    private long epHashKey;
+
+    // White-relative incremental evaluation state. phaseUnits is kept
+    // unclamped so promotions above the starting material can later be undone
+    // without losing the amount hidden by the evaluator's phase cap.
+    int incrementalMaterialScore;
+    int incrementalMgPstScore;
+    int incrementalEgPstScore;
+    int phaseUnits;
+    long pawnZobristKey;
 
     public byte[] mailbox = new byte[64]; // encoded as color*6+type, or -1 if empty
 
@@ -26,13 +38,14 @@ public class Board {
 
     // Each undo takes two longs instead of an allocated object and deque node.
     // State bits: move 0..15, captured piece + 1 at 16..19, castling rights
-    // 20..23, ep square + 1 at 24..30, signed halfmove clock at 31..62.
+    // 20..23, ep square + 1 at 24..30, signed halfmove clock at 31..62,
+    // and whether EP contributed to the old key at bit 63.
     private long[] historyState = new long[64];
     private long[] historyKeys = new long[64];
     private int historySize;
 
     private void pushHistory(int move, int capturedPieceCode, int oldCastling,
-                             int oldEp, int oldHalfmove, long oldKey) {
+                             int oldEp, int oldHalfmove, long oldKey, long oldEpKey) {
         if (historySize == historyState.length) {
             historyState = Arrays.copyOf(historyState, historySize * 2);
             historyKeys = Arrays.copyOf(historyKeys, historySize * 2);
@@ -41,7 +54,8 @@ public class Board {
                 | ((long) (capturedPieceCode + 1) & 15L) << 16
                 | ((long) oldCastling & 15L) << 20
                 | ((long) (oldEp + 1) & 127L) << 24
-                | ((long) oldHalfmove & 0xffffffffL) << 31;
+                | ((long) oldHalfmove & 0xffffffffL) << 31
+                | (oldEpKey != 0L ? Long.MIN_VALUE : 0L);
         historyKeys[historySize++] = oldKey;
     }
 
@@ -100,7 +114,9 @@ public class Board {
         fullmoveNumber = parts.length > 5 ? Integer.parseInt(parts[5]) : 1;
 
         recomputeOccupancy();
+        epHashKey = enPassantHashKey();
         zobristKey = computeZobristFromScratch();
+        recomputeEvaluationState();
     }
 
     private int typeFromChar(char c) {
@@ -141,9 +157,81 @@ public class Board {
         if ((castlingRights & CASTLE_WQ) != 0) key ^= Zobrist.CASTLE_KEY[1];
         if ((castlingRights & CASTLE_BK) != 0) key ^= Zobrist.CASTLE_KEY[2];
         if ((castlingRights & CASTLE_BQ) != 0) key ^= Zobrist.CASTLE_KEY[3];
-        if (epSquare != -1) key ^= Zobrist.EP_FILE_KEY[epSquare & 7];
+        key ^= enPassantHashKey();
         if (sideToMove == BLACK) key ^= Zobrist.SIDE_KEY;
         return key;
+    }
+
+    private long enPassantHashKey() {
+        if (epSquare == -1) return 0L;
+        int us = sideToMove, them = opposite(us);
+        if ((epSquare >>> 3) != (us == WHITE ? 5 : 2)
+                || (allOccupancy & (1L << epSquare)) != 0) return 0L;
+        long candidates = PAWN_ATTACKS[them][epSquare] & pieceBB[us][PAWN];
+        if (candidates == 0L) return 0L;
+        int capturedSquare = epSquare + (us == WHITE ? -8 : 8);
+        long capturedBit = 1L << capturedSquare;
+        if ((pieceBB[them][PAWN] & capturedBit) == 0L) return 0L;
+        int king = kingSquare(us);
+        long enemyPawns = pieceBB[them][PAWN] & ~capturedBit;
+        // Check the post-capture occupancy without makeMove (which hashes EP
+        // itself), mutation, allocation, or reliance on geometric adjacency.
+        if ((PAWN_ATTACKS[us][king] & enemyPawns) != 0L
+                || (KNIGHT_ATTACKS[king] & pieceBB[them][KNIGHT]) != 0L
+                || (KING_ATTACKS[king] & pieceBB[them][KING]) != 0L) return 0L;
+        long enemyRooksQueens = pieceBB[them][ROOK] | pieceBB[them][QUEEN];
+        long enemyBishopsQueens = pieceBB[them][BISHOP] | pieceBB[them][QUEEN];
+        while (candidates != 0L) {
+            int from = lsb(candidates);
+            candidates &= candidates - 1;
+            long after = (allOccupancy & ~(1L << from) & ~capturedBit) | (1L << epSquare);
+            if ((rookAttacks(king, after) & enemyRooksQueens) == 0L
+                    && (bishopAttacks(king, after) & enemyBishopsQueens) == 0L)
+                return Zobrist.EP_FILE_KEY[epSquare & 7];
+        }
+        return 0L;
+    }
+
+    private void recomputeEvaluationState() {
+        incrementalMaterialScore = 0;
+        incrementalMgPstScore = 0;
+        incrementalEgPstScore = 0;
+        phaseUnits = 0;
+        pawnZobristKey = 0L;
+        for (int color = 0; color < 2; color++) {
+            for (int type = 0; type < 6; type++) {
+                long pieces = pieceBB[color][type];
+                while (pieces != 0L) {
+                    int square = lsb(pieces);
+                    pieces &= pieces - 1;
+                    updateEvaluationState(color, type, square, 1);
+                }
+            }
+        }
+    }
+
+    private void updateEvaluationState(int color, int type, int square, int direction) {
+        int sign = color == WHITE ? 1 : -1;
+        incrementalMaterialScore += direction * sign * Evaluator.PIECE_VALUE[type];
+        incrementalMgPstScore += direction * sign * Evaluator.pieceSquareMgValue(color, type, square);
+        incrementalEgPstScore += direction * sign * Evaluator.pieceSquareEgValue(color, type, square);
+        phaseUnits += direction * Evaluator.phaseWeight(type);
+        if (type == PAWN) pawnZobristKey ^= Zobrist.PAWN_KEY[color][square];
+    }
+
+    private void updateMovedPieceEvaluation(int color, int type, int from, int to) {
+        int sign = color == WHITE ? 1 : -1;
+        incrementalMgPstScore += sign * (Evaluator.pieceSquareMgValue(color, type, to)
+                - Evaluator.pieceSquareMgValue(color, type, from));
+        incrementalEgPstScore += sign * (Evaluator.pieceSquareEgValue(color, type, to)
+                - Evaluator.pieceSquareEgValue(color, type, from));
+        if (type == PAWN) {
+            pawnZobristKey ^= Zobrist.PAWN_KEY[color][from] ^ Zobrist.PAWN_KEY[color][to];
+        }
+    }
+
+    int cachedGamePhase() {
+        return Math.min(phaseUnits, Evaluator.PHASE_MAX);
     }
 
     public String toFen() {
@@ -211,6 +299,7 @@ public class Board {
     }
 
     private void removePiece(int color, int type, int sq) {
+        updateEvaluationState(color, type, sq, -1);
         pieceBB[color][type] &= ~(1L << sq);
         occupancy[color] &= ~(1L << sq);
         allOccupancy &= ~(1L << sq);
@@ -219,6 +308,7 @@ public class Board {
     }
 
     private void placePiece(int color, int type, int sq) {
+        updateEvaluationState(color, type, sq, 1);
         pieceBB[color][type] |= 1L << sq;
         occupancy[color] |= 1L << sq;
         allOccupancy |= 1L << sq;
@@ -227,14 +317,22 @@ public class Board {
     }
 
     private void movePieceQuiet(int color, int type, int from, int to) {
-        removePiece(color, type, from);
-        placePiece(color, type, to);
+        long fromBit = 1L << from;
+        long toBit = 1L << to;
+        pieceBB[color][type] = (pieceBB[color][type] & ~fromBit) | toBit;
+        occupancy[color] = (occupancy[color] & ~fromBit) | toBit;
+        allOccupancy = (allOccupancy & ~fromBit) | toBit;
+        mailbox[from] = EMPTY;
+        mailbox[to] = (byte) (color * 6 + type);
+        zobristKey ^= Zobrist.PIECE_KEY[color][type][from] ^ Zobrist.PIECE_KEY[color][type][to];
+        updateMovedPieceEvaluation(color, type, from, to);
     }
 
     public void makeMove(int move) {
         int oldCastling = castlingRights;
         int oldHalfmove = halfmoveClock;
         long oldKey = zobristKey;
+        long oldEpKey = epHashKey;
         int capturedPieceCode = EMPTY;
 
         int from = Move.from(move);
@@ -269,11 +367,11 @@ public class Board {
                 capturedPieceCode = them * 6 + capturedType;
                 removePiece(them, capturedType, to);
             }
-            removePiece(us, movingType, from);
             if (Move.isPromotion(move)) {
+                removePiece(us, movingType, from);
                 placePiece(us, Move.promotionPieceType(move), to);
             } else {
-                placePiece(us, movingType, to);
+                movePieceQuiet(us, movingType, from, to);
             }
         }
 
@@ -297,8 +395,7 @@ public class Board {
                 zobristKey ^= Zobrist.CASTLE_KEY[bit];
             }
         }
-        if (oldEp != -1) zobristKey ^= Zobrist.EP_FILE_KEY[oldEp & 7];
-        if (newEp != -1) zobristKey ^= Zobrist.EP_FILE_KEY[newEp & 7];
+        zobristKey ^= oldEpKey;
         zobristKey ^= Zobrist.SIDE_KEY;
 
         castlingRights = newCastling;
@@ -310,7 +407,9 @@ public class Board {
         if (us == BLACK) fullmoveNumber++;
 
         sideToMove = them;
-        pushHistory(move, capturedPieceCode, oldCastling, oldEp, oldHalfmove, oldKey);
+        epHashKey = newEp == -1 ? 0L : enPassantHashKey();
+        zobristKey ^= epHashKey;
+        pushHistory(move, capturedPieceCode, oldCastling, oldEp, oldHalfmove, oldKey, oldEpKey);
     }
 
     private int clearCastlingRightsForSquare(int rights, int sq) {
@@ -341,16 +440,17 @@ public class Board {
             if (us == WHITE) movePieceQuietNoHash(WHITE, ROOK, 3, 0);
             else movePieceQuietNoHash(BLACK, ROOK, 59, 56);
         } else if (flag == Move.EP_CAPTURE) {
-            int movingType = PAWN;
-            removePieceNoHash(us, movingType, to);
-            placePieceNoHash(us, movingType, from);
+            movePieceQuietNoHash(us, PAWN, to, from);
             int capSq = to + (us == WHITE ? -8 : 8);
             placePieceNoHash(them, PAWN, capSq);
         } else {
             int placedType = Move.isPromotion(move) ? Move.promotionPieceType(move) : pieceTypeAt(to);
-            removePieceNoHash(us, placedType, to);
-            int originalType = Move.isPromotion(move) ? PAWN : placedType;
-            placePieceNoHash(us, originalType, from);
+            if (Move.isPromotion(move)) {
+                removePieceNoHash(us, placedType, to);
+                placePieceNoHash(us, PAWN, from);
+            } else {
+                movePieceQuietNoHash(us, placedType, to, from);
+            }
             if (capturedPieceCode != EMPTY) {
                 int capColor = capturedPieceCode / 6;
                 int capType = capturedPieceCode % 6;
@@ -360,6 +460,7 @@ public class Board {
 
         castlingRights = (int) (state >>> 20) & 15;
         epSquare = ((int) (state >>> 24) & 127) - 1;
+        epHashKey = state < 0L ? Zobrist.EP_FILE_KEY[epSquare & 7] : 0L;
         halfmoveClock = (int) (state >>> 31);
         zobristKey = historyKeys[historySize];
         if (us == BLACK) fullmoveNumber--;
@@ -367,6 +468,7 @@ public class Board {
 
     // Variants that don't touch zobristKey (restored wholesale from Undo on unmake)
     private void removePieceNoHash(int color, int type, int sq) {
+        updateEvaluationState(color, type, sq, -1);
         pieceBB[color][type] &= ~(1L << sq);
         occupancy[color] &= ~(1L << sq);
         allOccupancy &= ~(1L << sq);
@@ -374,6 +476,7 @@ public class Board {
     }
 
     private void placePieceNoHash(int color, int type, int sq) {
+        updateEvaluationState(color, type, sq, 1);
         pieceBB[color][type] |= 1L << sq;
         occupancy[color] |= 1L << sq;
         allOccupancy |= 1L << sq;
@@ -381,14 +484,21 @@ public class Board {
     }
 
     private void movePieceQuietNoHash(int color, int type, int from, int to) {
-        removePieceNoHash(color, type, from);
-        placePieceNoHash(color, type, to);
+        long fromBit = 1L << from;
+        long toBit = 1L << to;
+        pieceBB[color][type] = (pieceBB[color][type] & ~fromBit) | toBit;
+        occupancy[color] = (occupancy[color] & ~fromBit) | toBit;
+        allOccupancy = (allOccupancy & ~fromBit) | toBit;
+        mailbox[from] = EMPTY;
+        mailbox[to] = (byte) (color * 6 + type);
+        updateMovedPieceEvaluation(color, type, from, to);
     }
 
     public void makeNullMove() {
-        pushHistory(-1, EMPTY, castlingRights, epSquare, halfmoveClock, zobristKey);
+        pushHistory(-1, EMPTY, castlingRights, epSquare, halfmoveClock, zobristKey, epHashKey);
 
-        if (epSquare != -1) zobristKey ^= Zobrist.EP_FILE_KEY[epSquare & 7];
+        zobristKey ^= epHashKey;
+        epHashKey = 0L;
         epSquare = -1;
         zobristKey ^= Zobrist.SIDE_KEY;
         sideToMove = opposite(sideToMove);
@@ -399,6 +509,7 @@ public class Board {
         sideToMove = opposite(sideToMove);
         castlingRights = (int) (state >>> 20) & 15;
         epSquare = ((int) (state >>> 24) & 127) - 1;
+        epHashKey = state < 0L ? Zobrist.EP_FILE_KEY[epSquare & 7] : 0L;
         halfmoveClock = (int) (state >>> 31);
         zobristKey = historyKeys[historySize];
     }

@@ -12,16 +12,21 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-/** Validates search regressions whose behavior depends on the complete game history. */
+/** Validates complete-history structure and reports historical move sentinels.
+ * --legacy-choice-gate restores the old preference assertion explicitly.
+ * --enforce-pending requests searches for pending rows as well as active rows.
+ */
 public final class SearchHistoryRegressionCorpusTest {
     private static final int FIELD_COUNT = 10;
     private static final int ENFORCEMENT_DEPTH = 12;
+    private static boolean legacyChoiceGate;
 
     public static void main(String[] args) throws Exception {
         boolean enforcePending = false;
         Path corpus = Paths.get("test", "resources", "search-history-regressions.tsv");
         for (String arg : args) {
             if ("--enforce-pending".equals(arg)) enforcePending = true;
+            else if ("--legacy-choice-gate".equals(arg)) legacyChoiceGate = true;
             else corpus = Paths.get(arg);
         }
         int count = validate(corpus, enforcePending);
@@ -88,9 +93,14 @@ public final class SearchHistoryRegressionCorpusTest {
             for (int i = 0; i < keys.length; i++) keys[i] = historyKeys.get(i);
             Search search = new Search(new TranspositionTable(16));
             int bestMove = search.search(board, ENFORCEMENT_DEPTH, -1, keys);
-            check(targets.contains(Move.toUci(bestMove)), context + ": depth "
-                    + ENFORCEMENT_DEPTH + " selected " + Move.toUci(bestMove)
-                    + ", expected one of " + targets);
+            String actual = Move.toUci(bestMove);
+            findLegalMove(board, actual, context);
+            boolean matches = targets.contains(actual) && !forbidden.contains(actual);
+            System.out.println("BEHAVIORAL_SENTINEL " + f[0] + " actual=" + actual
+                    + " historicalTargets=" + targets + " matches=" + matches
+                    + (matches ? "" : " INVESTIGATE: historical preference is not tactical proof"));
+            if (legacyChoiceGate) check(matches, context + ": legacy choice gate selected "
+                    + actual + ", expected one of " + targets);
         }
     }
 

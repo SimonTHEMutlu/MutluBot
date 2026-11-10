@@ -16,6 +16,85 @@ import static engine.Bitboards.*;
 public final class Evaluator {
     private Evaluator() {}
 
+    private static final int PAWN_TABLE_BITS = 14;
+    static final int DEFAULT_PAWN_TABLE_CAPACITY = 1 << PAWN_TABLE_BITS;
+    /** Direct-mapped, primitive-array pawn table owned by one search worker. */
+    static final class PawnTable {
+        private final int indexMask;
+        private final long[] keys;
+        private final long[] packedScores;
+        private final long[] whitePassers;
+        private final long[] blackPassers;
+        private final boolean[] valid;
+        long probes, hits, misses, replacements;
+        boolean enabled = true;
+        boolean instrumentationEnabled;
+
+        // Probe output is held here to avoid allocating an entry/result object.
+        long packedScore, whitePasserBits, blackPasserBits;
+
+        PawnTable() { this(DEFAULT_PAWN_TABLE_CAPACITY); }
+
+        PawnTable(int capacity) {
+            if (capacity <= 0 || (capacity & (capacity - 1)) != 0) {
+                throw new IllegalArgumentException("pawn table capacity must be a positive power of two");
+            }
+            indexMask = capacity - 1;
+            keys = new long[capacity];
+            packedScores = new long[capacity];
+            whitePassers = new long[capacity];
+            blackPassers = new long[capacity];
+            valid = new boolean[capacity];
+        }
+
+        private boolean probe(long key) {
+            int index = (int) key & indexMask;
+            if (instrumentationEnabled) probes++;
+            if (valid[index] && keys[index] == key) {
+                if (instrumentationEnabled) hits++;
+                packedScore = packedScores[index];
+                whitePasserBits = whitePassers[index];
+                blackPasserBits = blackPassers[index];
+                return true;
+            }
+            if (instrumentationEnabled) {
+                misses++;
+                if (valid[index]) replacements++;
+            }
+            return false;
+        }
+
+        private void store(long key) {
+            int index = (int) key & indexMask;
+            valid[index] = true;
+            keys[index] = key;
+            packedScores[index] = packedScore;
+            whitePassers[index] = whitePasserBits;
+            blackPassers[index] = blackPasserBits;
+        }
+
+        void clear() {
+            java.util.Arrays.fill(valid, false);
+            probes = hits = misses = replacements = 0;
+            packedScore = whitePasserBits = blackPasserBits = 0L;
+        }
+
+        void setEnabled(boolean value) { enabled = value; }
+        void setInstrumentationEnabled(boolean value) { instrumentationEnabled = value; }
+        PawnCacheStats stats() { return new PawnCacheStats(probes, hits, misses, replacements); }
+    }
+
+    static final class PawnCacheStats {
+        final long probes, hits, misses, replacements;
+
+        PawnCacheStats(long probes, long hits, long misses, long replacements) {
+            this.probes = probes;
+            this.hits = hits;
+            this.misses = misses;
+            this.replacements = replacements;
+        }
+    }
+
     public static final int PAWN_VALUE = 100;
     public static final int KNIGHT_VALUE = 320;
     public static final int BISHOP_VALUE = 330;
@@ -307,56 +386,48 @@ static {
 
     /** Score is from the perspective of the side to move (positive = good for side to move). */
     public static int evaluate(Board b) {
-    int mgScore = 0;
-    int egScore = 0;
+        return evaluateInternal(b, null);
+    }
+
+    /** Reference path used by parity and cache regressions. */
+    static int evaluateUncached(Board b) {
+        return evaluateInternal(b, null);
+    }
+
+    /** Search-worker path using that search's private pawn table. */
+    static int evaluate(Board b, PawnTable table) {
+        return evaluateInternal(b, table != null && table.enabled ? table : null);
+    }
+
+    private static int evaluateInternal(Board b, PawnTable table) {
+    int mgScore = b.incrementalMaterialScore + b.incrementalMgPstScore;
+    int egScore = b.incrementalMaterialScore + b.incrementalEgPstScore;
     int whiteKingSq = b.kingSquare(WHITE);
     int blackKingSq = b.kingSquare(BLACK);
-
-    for (int type = 0; type < 6; type++) {
-        int value = PIECE_VALUE[type];
-
-        long wb = b.pieceBB[WHITE][type];
-        while (wb != 0) {
-            int sq = lsb(wb);
-            wb &= wb - 1;
-            mgScore += value + PST_MG_WHITE[type][sq];
-            egScore += value + PST_EG_WHITE[type][sq];
-            if (type == PAWN) {
-                int relativeRank = sq >>> 3;
-                if (isPassedPawn(WHITE, b.pieceBB[BLACK][PAWN], sq)) {
-                    mgScore += PASSED_PAWN_MG_BONUS[relativeRank];
-                    egScore += PASSED_PAWN_EG_BONUS[relativeRank];
-                    egScore += kingProximity(whiteKingSq, sq)
-                            * PASSED_PAWN_KING_PROXIMITY[relativeRank];
-                }
-                egScore -= kingProximity(blackKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
-            }
+    PawnTable pawnTable = table;
+    if (table != null) {
+        if (!pawnTable.probe(b.pawnZobristKey)) {
+            calculatePawnFeatures(b, pawnTable);
+            pawnTable.store(b.pawnZobristKey);
         }
-        long bb2 = b.pieceBB[BLACK][type];
-        while (bb2 != 0) {
-            int sq = lsb(bb2);
-            bb2 &= bb2 - 1;
-            mgScore -= value + PST_MG_BLACK[type][sq];
-            egScore -= value + PST_EG_BLACK[type][sq];
-            if (type == PAWN) {
-                int relativeRank = 7 - (sq >>> 3);
-                if (isPassedPawn(BLACK, b.pieceBB[WHITE][PAWN], sq)) {
-                    mgScore -= PASSED_PAWN_MG_BONUS[relativeRank];
-                    egScore -= PASSED_PAWN_EG_BONUS[relativeRank];
-                    egScore -= kingProximity(blackKingSq, sq)
-                            * PASSED_PAWN_KING_PROXIMITY[relativeRank];
-                }
-                egScore += kingProximity(whiteKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
-            }
-        }
+        long cachedPawnFeatures = pawnTable.packedScore;
+        mgScore += (int) (cachedPawnFeatures >> 32);
+        egScore += (int) cachedPawnFeatures;
+        egScore += dynamicPassedPawnProximity(b, whiteKingSq, blackKingSq,
+                pawnTable.whitePasserBits, pawnTable.blackPasserBits);
+    } else {
+        long pawnFeatures = calculatePawnFeatures(b, null);
+        mgScore += (int) (pawnFeatures >> 32);
+        egScore += (int) pawnFeatures;
+        egScore += dynamicPassedPawnProximityUncached(b, whiteKingSq, blackKingSq);
     }
 
     if (popcount(b.pieceBB[WHITE][BISHOP]) >= 2) { mgScore += 30; egScore += 30; }
     if (popcount(b.pieceBB[BLACK][BISHOP]) >= 2) { mgScore -= 30; egScore -= 30; }
 
-    long pawnStructure = pawnStructureTerms(b);
-    mgScore += (int) (pawnStructure >> 32);
-    egScore += (int) pawnStructure;
+    long backwardPawns = dynamicBackwardPawnTerms(b);
+    mgScore += (int) (backwardPawns >> 32);
+    egScore += (int) backwardPawns;
 
     long rookFiles = rookFileTerms(b);
     mgScore += (int) (rookFiles >> 32);
@@ -375,9 +446,153 @@ static {
     return b.sideToMove == WHITE ? blended : -blended;
     }
 
+    /** Isolated-pawn scores, base passer bonuses, and passer masks use pawn locations only. */
+    private static long calculatePawnFeatures(Board b, PawnTable output) {
+        int mg = 0;
+        int eg = 0;
+        long whitePawns = b.pieceBB[WHITE][PAWN];
+        long blackPawns = b.pieceBB[BLACK][PAWN];
+        long whitePassers = 0L;
+        long blackPassers = 0L;
+
+        long pawns = whitePawns;
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int file = sq & 7;
+            if ((whitePawns & ADJACENT_FILE_MASK[file]) == 0L) {
+                mg -= isolatedMgPenalty(file);
+                eg -= isolatedEgPenalty(file);
+            }
+            int relativeRank = sq >>> 3;
+            if (isPassedPawn(WHITE, blackPawns, sq)) {
+                whitePassers |= 1L << sq;
+                mg += PASSED_PAWN_MG_BONUS[relativeRank];
+                eg += PASSED_PAWN_EG_BONUS[relativeRank];
+            }
+        }
+
+        pawns = blackPawns;
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int file = sq & 7;
+            if ((blackPawns & ADJACENT_FILE_MASK[file]) == 0L) {
+                mg += isolatedMgPenalty(file);
+                eg += isolatedEgPenalty(file);
+            }
+            int relativeRank = 7 - (sq >>> 3);
+            if (isPassedPawn(BLACK, whitePawns, sq)) {
+                blackPassers |= 1L << sq;
+                mg -= PASSED_PAWN_MG_BONUS[relativeRank];
+                eg -= PASSED_PAWN_EG_BONUS[relativeRank];
+            }
+        }
+
+        long packed = ((long) mg << 32) | (eg & 0xffffffffL);
+        if (output != null) {
+            output.packedScore = packed;
+            output.whitePasserBits = whitePassers;
+            output.blackPasserBits = blackPassers;
+        }
+        return packed;
+    }
+
+    private static int isolatedMgPenalty(int file) {
+        return (file == 3 || file == 4) ? ISOLATED_CENTER_MG
+                : (file == 2 || file == 5) ? ISOLATED_WING_MG : ISOLATED_FLANK_MG;
+    }
+
+    private static int isolatedEgPenalty(int file) {
+        return (file == 3 || file == 4) ? ISOLATED_CENTER_EG
+                : (file == 2 || file == 5) ? ISOLATED_WING_EG : ISOLATED_FLANK_EG;
+    }
+
+    private static int dynamicPassedPawnProximity(Board b, int whiteKingSq, int blackKingSq,
+                                                   long whitePassers, long blackPassers) {
+        int score = 0;
+        long pawns = whitePassers;
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int relativeRank = sq >>> 3;
+            score += kingProximity(whiteKingSq, sq) * PASSED_PAWN_KING_PROXIMITY[relativeRank];
+        }
+        pawns = blackPassers;
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int relativeRank = 7 - (sq >>> 3);
+            score -= kingProximity(blackKingSq, sq) * PASSED_PAWN_KING_PROXIMITY[relativeRank];
+        }
+        pawns = b.pieceBB[WHITE][PAWN];
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            score -= kingProximity(blackKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
+        }
+        pawns = b.pieceBB[BLACK][PAWN];
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            score += kingProximity(whiteKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
+        }
+        return score;
+    }
+
+    private static int dynamicPassedPawnProximityUncached(Board b, int whiteKingSq, int blackKingSq) {
+        int score = 0;
+        long pawns = b.pieceBB[WHITE][PAWN];
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int relativeRank = sq >>> 3;
+            if (isPassedPawn(WHITE, b.pieceBB[BLACK][PAWN], sq)) {
+                score += kingProximity(whiteKingSq, sq) * PASSED_PAWN_KING_PROXIMITY[relativeRank];
+            }
+            score -= kingProximity(blackKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
+        }
+        pawns = b.pieceBB[BLACK][PAWN];
+        while (pawns != 0L) {
+            int sq = lsb(pawns);
+            pawns &= pawns - 1;
+            int relativeRank = 7 - (sq >>> 3);
+            if (isPassedPawn(BLACK, b.pieceBB[WHITE][PAWN], sq)) {
+                score -= kingProximity(blackKingSq, sq) * PASSED_PAWN_KING_PROXIMITY[relativeRank];
+            }
+            score += kingProximity(whiteKingSq, sq) * ENEMY_PAWN_KING_PROXIMITY;
+        }
+        return score;
+    }
+
+    private static long dynamicBackwardPawnTerms(Board b) {
+        int mg = 0;
+        int eg = 0;
+        for (int color = WHITE; color <= BLACK; color++) {
+            long pawns = b.pieceBB[color][PAWN];
+            long friendly = pawns;
+            int sign = color == WHITE ? 1 : -1;
+            while (pawns != 0L) {
+                int sq = lsb(pawns);
+                pawns &= pawns - 1;
+                if ((friendly & ADJACENT_FILE_MASK[sq & 7]) != 0L
+                        && isBackwardPawn(b, color, sq)) {
+                    mg -= sign * BACKWARD_SEMIOPEN_MG;
+                    eg -= sign * BACKWARD_SEMIOPEN_EG;
+                }
+            }
+        }
+        return ((long) mg << 32) | (eg & 0xffffffffL);
+    }
+
     /** Middlegame piece-square value, exposed package-private for evaluator regressions. */
     static int pieceSquareMgValue(int color, int type, int square) {
         return color == WHITE ? PST_MG_WHITE[type][square] : PST_MG_BLACK[type][square];
+    }
+
+    /** Endgame piece-square value, used by Board's incremental score cache. */
+    static int pieceSquareEgValue(int color, int type, int square) {
+        return color == WHITE ? PST_EG_WHITE[type][square] : PST_EG_BLACK[type][square];
     }
 
     /**
@@ -972,11 +1187,16 @@ static {
     /** gamePhase is used in order to have multiple piece-square tables for different phases of the game */
     /** Returns a value from 0 (kings + pawns only) to PHASE_MAX (full starting material). */
     public static int gamePhase(Board b) {
-    int phase = 0;
-    phase += popcount(b.pieceBB[WHITE][KNIGHT] | b.pieceBB[BLACK][KNIGHT]) * PHASE_KNIGHT;
-    phase += popcount(b.pieceBB[WHITE][BISHOP] | b.pieceBB[BLACK][BISHOP]) * PHASE_BISHOP;
-    phase += popcount(b.pieceBB[WHITE][ROOK] | b.pieceBB[BLACK][ROOK]) * PHASE_ROOK;
-    phase += popcount(b.pieceBB[WHITE][QUEEN] | b.pieceBB[BLACK][QUEEN]) * PHASE_QUEEN;
-    return Math.min(phase, PHASE_MAX); // clamp: promoted pawns could otherwise push this over PHASE_MAX
+        return b.cachedGamePhase();
+    }
+
+    static int phaseWeight(int type) {
+        switch (type) {
+            case KNIGHT: return PHASE_KNIGHT;
+            case BISHOP: return PHASE_BISHOP;
+            case ROOK: return PHASE_ROOK;
+            case QUEEN: return PHASE_QUEEN;
+            default: return 0;
+        }
     }
 }

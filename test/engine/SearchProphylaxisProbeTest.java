@@ -6,6 +6,7 @@ import java.util.List;
 /** Focused tests for the opt-in, bounded root prophylaxis experiment. */
 public final class SearchProphylaxisProbeTest {
     public static void main(String[] args) {
+        testProbeDefaultsDisabledAndCanBeEnabled();
         testEnabledProbeIsBoundedAndRestoresBoard();
         testProbeDoesNotChangeNormalSearchWorkOrCandidateScores();
         testForcingAlternativesDoNotDisableQuietCandidateProbes();
@@ -14,6 +15,23 @@ public final class SearchProphylaxisProbeTest {
         testInterruptedRootReturnsLastCompletedMove();
         testCheckedAndQueenlessRootsDoNotTrigger();
         System.out.println("SearchProphylaxisProbeTest passed");
+    }
+
+    private static void testProbeDefaultsDisabledAndCanBeEnabled() {
+        Board board = new Board();
+        Search search = new Search(new TranspositionTable(1));
+        final int[] callbacks = {0};
+        search.setProphylaxisCandidateListener((depth, move, score, threatScore,
+                adjustment, metrics, line, leaves) -> callbacks[0]++);
+
+        search.search(board, 4, -1, null);
+        check(search.getLastProphylaxisDiagnostics() == null && callbacks[0] == 0,
+                "ordinary Search must leave the probe disabled by default");
+
+        search.setProphylaxisProbeEnabled(true);
+        search.search(board, 4, -1, null);
+        check(search.getLastProphylaxisDiagnostics() != null && callbacks[0] > 0,
+                "explicitly enabling the probe must produce diagnostics and callbacks");
     }
 
     private static void testEnabledProbeIsBoundedAndRestoresBoard() {

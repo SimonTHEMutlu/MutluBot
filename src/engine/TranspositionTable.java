@@ -8,12 +8,15 @@ public class TranspositionTable {
 
     // One key and one packed value per slot: 16 bytes instead of an Entry
     // object plus a reference. The valid bit permits a zero Zobrist key.
-    private static final long VALID = 1L << 58;
+    // move16 + score16 + depth8 + flag2 + age14 + rule50(7) + valid1 = 64.
+    // Preserve the 16-byte entry and its move hint across clock mismatches.
+    private static final long VALID = Long.MIN_VALUE;
     private static final int SCORE_SHIFT = 16;
     private static final int DEPTH_SHIFT = 32;
     private static final int FLAG_SHIFT = 40;
     private static final int AGE_SHIFT = 42;
-    private static final long AGE_MASK = 0xffffL;
+    private static final long AGE_MASK = 0x3fffL;
+    private static final int RULE50_SHIFT = 56;
 
     private long[] keys;
     private long[] values;
@@ -40,15 +43,21 @@ public class TranspositionTable {
     }
 
     public void newSearch() {
-        // Clear before the 16-bit generation wraps, so stale entries cannot
+        // Clear before the 14-bit generation wraps, so stale entries cannot
         // look as though they came from the current search.
         if (++currentAge > AGE_MASK) clear();
     }
 
     public void store(long key, int depth, int score, int flag, int move) {
+        store(key, depth, score, flag, move, 0);
+    }
+
+    public void store(long key, int depth, int score, int flag, int move, int halfmoveClock) {
+        int clock = Math.max(0, Math.min(100, halfmoveClock));
         int idx = (int) key & mask;
         long old = values[idx];
         if ((old & VALID) != 0 && keys[idx] == key
+                && halfmoveClockOf(old) == clock
                 && depthOf(old) > depth && age(old) == currentAge && flag != EXACT) {
             return;
         }
@@ -57,7 +66,8 @@ public class TranspositionTable {
                 | ((long) score & 0xffffL) << SCORE_SHIFT
                 | ((long) depth & 0xffL) << DEPTH_SHIFT
                 | ((long) flag & 3L) << FLAG_SHIFT
-                | ((long) currentAge & AGE_MASK) << AGE_SHIFT;
+                | ((long) currentAge & AGE_MASK) << AGE_SHIFT
+                | (long) clock << RULE50_SHIFT;
         keys[idx] = key;
         values[idx] = packed;
     }
@@ -92,6 +102,10 @@ public class TranspositionTable {
 
     public static int moveOf(long packed) {
         return (int) packed & 0xffff;
+    }
+
+    public static int halfmoveClockOf(long packed) {
+        return (int) (packed >>> RULE50_SHIFT) & 127;
     }
 
     /** True when this entry was written during the current top-level search. */

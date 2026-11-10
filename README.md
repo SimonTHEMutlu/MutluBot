@@ -1,5 +1,10 @@
 # MutluBot
 
+For the current implemented/experimental/deferred feature inventory and build
+handoff, see [PROJECT_STATUS.md](PROJECT_STATUS.md). Historical engineering
+reviews are retained in `issues.md` and `feedback.md`; some recommendations
+in those snapshots have already been implemented.
+
 MutluBot is a small, from-scratch UCI chess engine written in Java, built around 64-bit
 bitboards. It's meant as a clean foundation to build a stronger engine on
 top of — every component (move generation, evaluation, search) is in its
@@ -87,6 +92,37 @@ Other useful commands while poking at it directly:
 
 - `d` — prints the current board and FEN (not part of UCI, just a debug helper)
 - `perft 5` — runs a perft test from the current position (also a debug helper)
+
+## Reverse futility pruning (game-test positive)
+
+Issue 5.1's guarded reverse futility pruning is enabled by default. Disable it
+without rebuilding via UCI:
+
+```text
+setoption name ReverseFutilityPruning value false
+```
+
+Set the value to `true` to enable it again. A change clears transposition-table
+bounds from the previous policy. The choice survives `ucinewgame` and Hash
+changes. The validated 100-centipawn-per-ply margin, shallow depth limit and
+safety guards are unchanged; this promotion adds no other selective technique.
+
+Promotion is recorded as **game-test positive**: the amended 200-game screen
+scored 96 wins, 29 draws and 75 losses (55.25%). This is a practical engineering
+decision, not a proven +37 Elo gain. The original clock-fault stop, subsequent
+symmetrical timeout-scoring amendment and exploratory confidence interval are
+documented in the [validation summary](docs/VALIDATION.md#rfp).
+
+The synthetic active-king rook ending remains a permanent exposed performance
+sentinel in `test/resources/search-performance-regressions.tsv`, exercised by
+`engine.SearchRfpActiveKingRegressionTest`. The default test checks hard
+invariants at depth 8; `--deep` reports depth-21 behavior. It does not require
+Kg7 instead of Rf7+ or impose a timing threshold. Do not retune or restrict RFP
+to improve this single fixture without evidence from real games.
+
+Any future independent confirmation must use a fresh opening sample and freeze
+timeout, overhead, draw and adjudication rules before the first game. The
+consumed opening sample must not be presented as fresh evidence.
 
 ## Testing
 
