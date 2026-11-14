@@ -33,7 +33,7 @@ public class TranspositionTable {
         int power = Integer.highestOneBit((int) Math.min(numEntries, 1L << 30));
         keys = new long[power];
         values = new long[power];
-        mask = power - 1;
+        mask = power/2 - 1;
         currentAge = 0;
     }
 
@@ -54,7 +54,23 @@ public class TranspositionTable {
 
     public void store(long key, int depth, int score, int flag, int move, int halfmoveClock) {
         int clock = Math.max(0, Math.min(100, halfmoveClock));
-        int idx = (int) key & mask;
+        int bucket = (int) key & mask;
+        int first = bucket * 2;
+        int second = bucket *2+1;
+        int idx;
+        if((values[first] & VALID ) != 0 && keys[first] == key) {
+            idx = first;
+        } else if((values[second] & VALID) != 0 && keys[second] == key) {
+            idx = second;
+        } else if((values[first] & VALID) == 0) {
+            idx = first;
+        } else if((values[second] & VALID) == 0) {
+            idx = second;
+        } else {
+            int firstDepth = depthOf(values[first]);
+            int secondDepth = depthOf(values[second]);
+            idx = (firstDepth <= secondDepth) ? first : second;
+        }
         long old = values[idx];
         if ((old & VALID) != 0 && keys[idx] == key
                 && halfmoveClockOf(old) == clock
@@ -83,9 +99,16 @@ public class TranspositionTable {
 
     /** Allocation-free lookup for the search hot path; zero means no entry. */
     public long probePacked(long key) {
-        int idx = (int) key & mask;
-        long packed = values[idx];
-        return (packed & VALID) != 0 && keys[idx] == key ? packed : 0;
+        int bucket = (int) key & mask;
+        int first = bucket * 2;
+        int second = bucket *2+1;
+        
+        if((values[first] & VALID ) != 0 && keys[first] == key) {
+            return values[first];
+        } else if((values[second] & VALID) != 0 && keys[second] == key) {
+            return values[second];
+        } 
+            return 0;
     }
 
     public static int depthOf(long packed) {

@@ -25,8 +25,20 @@ public final class PositionStorageTest {
         checkProbe(tt.probe(0), 3, -32000, TranspositionTable.UPPER_BOUND, 456);
         long collision = 1L << 16; // Same slot in a 1 MB table.
         tt.store(collision, 4, 32000, TranspositionTable.EXACT, 789);
-        check(tt.probe(0) == null, "collision replacement");
+        checkProbe(tt.probe(0), 3, -32000, TranspositionTable.UPPER_BOUND, 456);
         checkProbe(tt.probe(collision), 4, 32000, TranspositionTable.EXACT, 789);
+        long thirdKey = 2L << 16;
+        tt.store(thirdKey, 5, 100, TranspositionTable.EXACT, 321);
+        // Write your three assertions here
+        check(tt.probe(0) == null, "evicted");
+        checkProbe(tt.probe(collision), 4, 32000, TranspositionTable.EXACT, 789);
+        checkProbe(tt.probe(thirdKey), 5, 100,
+        TranspositionTable.EXACT, 321);
+
+        tt.store(collision, 6, 250, TranspositionTable.EXACT, 999);
+        checkProbe(tt.probe(collision), 6, 250, TranspositionTable.EXACT, 999);
+        checkProbe(tt.probe(thirdKey), 5, 100, TranspositionTable.EXACT, 321);
+        
         tt.clear();
         check(tt.probe(collision) == null, "clear");
     }
