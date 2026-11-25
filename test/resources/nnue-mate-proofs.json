@@ -1,0 +1,297 @@
+{
+  "method": "Exhaustive python-chess legal AND/OR tree, every defender reply, maximum three plies; no engine evaluation or external network",
+  "positions": [
+    {
+      "id": "queen-sacrifice",
+      "fen": "5r1k/6pp/4Q2N/8/8/8/8/6K1 w - - 0 1",
+      "mate_plies": 3,
+      "accepted_moves": {
+        "e6g8": {
+          "all_replies": {
+            "f8g8": {
+              "choose": "h6f7",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        }
+      },
+      "first_move_types": {
+        "e6g8": {
+          "capture": false,
+          "check": true
+        }
+      }
+    },
+    {
+      "id": "quiet-key",
+      "fen": "7k/8/5K2/8/8/8/8/3Q4 w - - 0 1",
+      "mate_plies": 3,
+      "accepted_moves": {
+        "f6f7": {
+          "all_replies": {
+            "h8h7": {
+              "choose": "d1h1",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        },
+        "f6g6": {
+          "all_replies": {
+            "h8g8": {
+              "choose": "d1d8",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        },
+        "d1d7": {
+          "all_replies": {
+            "h8g8": {
+              "choose": "d7g7",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        },
+        "d1g4": {
+          "all_replies": {
+            "h8h7": {
+              "choose": "g4g7",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        },
+        "d1g1": {
+          "all_replies": {
+            "h8h7": {
+              "choose": "g1g7",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        }
+      },
+      "first_move_types": {
+        "f6f7": {
+          "capture": false,
+          "check": false
+        },
+        "f6g6": {
+          "capture": false,
+          "check": false
+        },
+        "d1d7": {
+          "capture": false,
+          "check": false
+        },
+        "d1g4": {
+          "capture": false,
+          "check": false
+        },
+        "d1g1": {
+          "capture": false,
+          "check": false
+        }
+      }
+    },
+    {
+      "id": "real-game-quiet-bishop",
+      "fen": "r3k2r/1ppb2Qp/p3p2B/4p3/n7/8/P1P2PPP/5RK1 w - - 0 23",
+      "mate_plies": 3,
+      "accepted_moves": {
+        "h6g5": {
+          "all_replies": {
+            "a4b2": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a4b6": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a4c3": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a4c5": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a6a5": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a8a7": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a8b8": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a8c8": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "a8d8": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "b7b5": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "b7b6": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "c7c5": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "c7c6": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "d7b5": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "d7c6": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "d7c8": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "e5e4": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "h7h5": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "h7h6": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "h8f8": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            },
+            "h8g8": {
+              "choose": "g7e7",
+              "proof": {
+                "mate": true
+              }
+            }
+          }
+        }
+      },
+      "first_move_types": {
+        "h6g5": {
+          "capture": false,
+          "check": false
+        }
+      },
+      "source_game_sha256": "f32090085c4a301be5725ef7afde2a9f0ba4b7f5dda62a3f198f6c1f42f533b2",
+      "source_history_uci": [
+        "e2e4",
+        "e7e5",
+        "g1f3",
+        "b8c6",
+        "f1b5",
+        "a7a6",
+        "b5a4",
+        "g8f6",
+        "e1g1",
+        "f8e7",
+        "d2d4",
+        "e5d4",
+        "e4e5",
+        "f6e4",
+        "f3d4",
+        "e4c5",
+        "d4f5",
+        "c5a4",
+        "f5g7",
+        "e8f8",
+        "c1h6",
+        "a4b2",
+        "d1h5",
+        "f8g8",
+        "b1d2",
+        "d7d6",
+        "e5e6",
+        "f7e6",
+        "a1e1",
+        "c6e5",
+        "e1e5",
+        "d6e5",
+        "g7e8",
+        "b2a4",
+        "d2e4",
+        "c8d7",
+        "h5g4",
+        "e7g5",
+        "e4g5",
+        "d8g5",
+        "g4g5",
+        "g8f7",
+        "g5g7",
+        "f7e8"
+      ]
+    }
+  ]
+}

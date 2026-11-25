@@ -1,0 +1,35 @@
+{
+    "name":  "MutluBot Pilot 2",
+    "file":  "pilot2.nnue",
+    "sha256":  "ce70ca5e6a1189e7e7ae3b2d2860040d57a1c3a8e0e0c5c0a584d93d31a3976d",
+    "bytes":  197664,
+    "format":  "MUTLUN01",
+    "architecture":  {
+                         "base_features":  768,
+                         "hidden":  128,
+                         "perspectives":  2,
+                         "activation":  "CReLU",
+                         "input_buckets":  1,
+                         "output_heads":  1,
+                         "qa":  255,
+                         "qb":  256,
+                         "output_perspective":  "side_to_move"
+                     },
+    "training":  {
+                     "own_weights":  true,
+                     "outside_pretrained_weights":  false,
+                     "selected_epoch":  30,
+                     "train_positions":  2584890,
+                     "validation_positions":  644667,
+                     "validation_mae_cp":  73.058134317398071,
+                     "data_manifest_sha256":  "bf7e65f66afb49cf342693941127d468d6ebad58119965fcf4b91d0ba0524ccb",
+                     "checkpoint_sha256":  "d4675b8483ec062c2428045bc1287b9931ef6a6238a88aa4d2bb52f92f934003"
+                 },
+    "parity":  {
+                   "file":  "pilot2-parity.tsv",
+                   "sha256":  "f95225d4ffeff1a30d30121370bc529d1a2974be174dbce86749db723da69d21",
+                   "rows":  128,
+                   "values":  "Exported NNUE integer predictions, not teacher labels"
+               },
+    "strength_status":  "Development-game positive; full independent two-opponent confirmation pending; no certified Elo claim"
+}

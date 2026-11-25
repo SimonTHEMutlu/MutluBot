@@ -15,7 +15,7 @@ import java.util.List;
  */
 public class UCIEngine {
 
-    private static final String ENGINE_NAME = "MutluBot v3 BETA";
+    private static final String ENGINE_NAME = "MutluBot NNUE (own network; optional HCE)";
     private static final String ENGINE_AUTHOR = "Basri Mutlu";
 
     private Board board = new Board();
@@ -24,6 +24,8 @@ public class UCIEngine {
     private boolean prophylaxisProbeEnabled;
     private boolean reverseFutilityEnabled = true;
     private boolean ponderOptionEnabled;
+    private NnueNetwork loadedNetwork;
+    private boolean useNnue;
     private final List<Long> gameHistory = new ArrayList<>();
 
     private Thread searchThread;
@@ -116,6 +118,8 @@ public class UCIEngine {
                 send("option name ProphylaxisProbe type check default false");
                 send("option name ReverseFutilityPruning type check default true");
                 send("option name Ponder type check default false");
+                send("option name UseNNUE type check default false");
+                send("option name EvalFile type string default <empty>");
                 send("uciok");
                 break;
             case "isready":
@@ -294,6 +298,7 @@ public class UCIEngine {
         final long fHardTimeBudget = ponder ? -1 : hardTimeBudget;
         final Board searchBoard = new Board();
         searchBoard.setFromFen(board.toFen());
+        searchBoard.setNnueNetwork(useNnue ? loadedNetwork : null);
         final Search searchForTask = search;
         searchForTask.clearStopRequestForNextSearch();
         final long[] searchHistory = historyArray;
@@ -409,11 +414,32 @@ public class UCIEngine {
                 int mb = Integer.parseInt(value);
                 tt = new TranspositionTable(mb);
                 search = new Search(tt);
+                search.setNnueNetwork(useNnue ? loadedNetwork : null);
                 search.setInfoListener(this::printInfo);
                 search.setProphylaxisProbeEnabled(prophylaxisProbeEnabled);
                 search.setReverseFutilityEnabled(reverseFutilityEnabled);
             } catch (NumberFormatException ignored) {
             }
+        } else if (name.equalsIgnoreCase("EvalFile")) {
+            try {
+                NnueNetwork next = value.isEmpty() || value.equals("<empty>")
+                        ? null : NnueNetwork.load(value);
+                loadedNetwork = next;
+                applyEvaluator();
+            } catch (java.io.IOException error) {
+                // Transactional failure: keep the previous working evaluator.
+                send("info string NNUE load failed; previous evaluator retained: " + error.getMessage());
+            }
+        } else if (name.equalsIgnoreCase("UseNNUE")) {
+            if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("on") || value.equals("1"))
+                useNnue = true;
+            else if (value.equalsIgnoreCase("false") || value.equalsIgnoreCase("off") || value.equals("0"))
+                useNnue = false;
+            else {
+                send("info string Invalid UseNNUE value; evaluator unchanged");
+                return;
+            }
+            applyEvaluator();
         } else if (name.equalsIgnoreCase("ReverseFutilityPruning")) {
             reverseFutilityEnabled = value.equalsIgnoreCase("true")
                     || value.equalsIgnoreCase("on") || value.equals("1");
@@ -444,6 +470,20 @@ public class UCIEngine {
           .append(" time ").append(timeMs);
         if (!pv.isEmpty()) sb.append(" pv ").append(pv);
         send(sb.toString());
+    }
+
+    private void applyEvaluator() {
+        board.setNnueNetwork(useNnue ? loadedNetwork : null);
+        search.setNnueNetwork(useNnue ? loadedNetwork : null);
+        // Bounds from another evaluator must never survive an option switch.
+        tt.clear();
+        if (useNnue && loadedNetwork != null)
+            send("info string evaluator NNUE v" + loadedNetwork.version
+                    + " hidden " + loadedNetwork.hidden + " activation "
+                    + (loadedNetwork.activation == NnueNetwork.SCRELU ? "SCReLU" : "CReLU")
+                    + " input-buckets " + loadedNetwork.inputBuckets
+                    + " sha256 " + loadedNetwork.sha256);
+        else send("info string evaluator HCE" + (useNnue ? " (NNUE requested; no network loaded)" : ""));
     }
 
     private void send(String s) {

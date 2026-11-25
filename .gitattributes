@@ -1,0 +1,3 @@
+*.nnue binary
+*.sh text eol=lf
+networks/*-parity.tsv text eol=lf

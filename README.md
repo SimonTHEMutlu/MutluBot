@@ -1,5 +1,26 @@
 # MutluBot
 
+The `mutlubotNNUE` branch includes MutluBot's own optional NNUE evaluator,
+CPU trainer and the [Pilot 2 network](networks/README.md).
+See [NNUE usage and validation](docs/NNUE.md). Architecture/training improvements
+are experimental; superiority over the classic HCE engine has not yet been
+established. HCE remains available with `UseNNUE=false`.
+
+To get Pilot 2 on macOS in a separate checkout:
+
+```bash
+cd ~/Downloads
+git clone --branch mutlubotNNUE --single-branch https://github.com/SimonTHEMutlu/MutluBot.git MutluBotNNUE
+cd MutluBotNNUE
+bash build.sh
+java -jar dist/chess-engine.jar
+```
+
+Send `uci`, set `EvalFile` to the absolute path of `networks/pilot2.nnue`,
+then set `UseNNUE` to `true`. Check the reported active network hash against
+[the model information](networks/README.md). Java is the only runtime
+dependency; Python and PyTorch are needed only for training/development.
+
 For the current implemented/experimental/deferred feature inventory and build
 handoff, see [PROJECT_STATUS.md](PROJECT_STATUS.md). Historical engineering
 reviews are retained in `issues.md` and `feedback.md`; some recommendations

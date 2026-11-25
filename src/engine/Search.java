@@ -133,6 +133,15 @@ public class Search {
     public static final int MAX_PLY = 128;
 
     private final TranspositionTable tt;
+    private NnueNetwork evaluationNetwork;
+    private boolean evaluationNetworkConfigured;
+
+    /** Must be changed only while the search worker is stopped. */
+    public void setNnueNetwork(NnueNetwork network) {
+        if (evaluationNetwork != network) tt.clear();
+        evaluationNetwork = network;
+        evaluationNetworkConfigured = true;
+    }
     private final Evaluator.PawnTable pawnTable;
     private final int[][] killerMoves = new int[MAX_PLY][2];
     private final int[][] historyTable = new int[64][64];
@@ -651,6 +660,7 @@ public class Search {
     private int searchInternal(Board board, int maxDepth, long softTimeMillis,
                                long hardTimeMillis, long[] gameHistoryKeys,
                                boolean resetStopRequest, Runnable timeControlReady) {
+        if (evaluationNetworkConfigured) board.setNnueNetwork(evaluationNetwork);
         if (resetStopRequest) stopRequested = false;
         lastProphylaxisDiagnostics = null;
         nodes = 0;

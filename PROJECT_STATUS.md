@@ -1,11 +1,17 @@
 # Engine handoff
 
-This is the engine source checkpoint prepared for the author's independent
-development on November 10, 2026. No further development or background game
-campaign is scheduled by this handoff.
+The `mutlubotNNUE` branch adds our own NNUE evaluator and publishes Pilot 2.
+The original HCE evaluator remains available through `UseNNUE=false`.
+This branch's source does not replace existing installed JARs automatically.
 
 ## Included
 
+- Own dual-perspective integer NNUE, Pilot 2 weights and exact integer parity
+  fixtures. Explicit UCI activation reports the network hash, survives search
+  board copies/new games/Hash changes and clears obsolete TT bounds.
+- Deferred feature-delta updates, versioned CReLU/SCReLU/four-king-bucket
+  architectures and CPU training/export/resume tools. Experimental alternative
+  networks have not demonstrated an improvement over Pilot 2.
 - Existing UCI lifecycle, pondering, clock-budget and legal-move/PV safeguards.
 - Incremental material/PST/phase bookkeeping, a bounded pawn cache with dynamic
   occupancy/king-dependent terms kept outside the cached structure, packed
@@ -30,7 +36,13 @@ interpret this source checkpoint as an Elo certification.
 - Lichess adapter changes, account configuration, opening books and launch
   scripts are private testing infrastructure, not engine source.
 - Raw local experiment snapshots, compiled outputs and native packages are not
-  part of the repository. Concise accepted-result summaries are included instead.
+  part of the repository. The small published Pilot 2 inference weights are
+  included; large datasets and training checkpoints are not.
+
+Pilot 2 scored 24 wins, 2 draws and 6 losses in a 32-game development screen
+against matched-source HCE at 5+0.05. An identical-weight repeat on the same
+opening roots scored 23-5-4; these are not independent opening samples or an
+Elo certification. Full two-opponent confirmation remains pending.
 
 `feedback.md` and `issues.md` preserve historical engineering reviews. Some
 recommendations in them predate the included improvements; use executable

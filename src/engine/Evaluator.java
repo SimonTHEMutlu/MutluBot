@@ -400,6 +400,7 @@ static {
     }
 
     private static int evaluateInternal(Board b, PawnTable table) {
+    if (b.nnue != null) return b.nnue.evaluate(b.sideToMove);
     int mgScore = b.incrementalMaterialScore + b.incrementalMgPstScore;
     int egScore = b.incrementalMaterialScore + b.incrementalEgPstScore;
     int whiteKingSq = b.kingSquare(WHITE);

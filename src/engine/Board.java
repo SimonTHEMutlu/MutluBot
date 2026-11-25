@@ -44,6 +44,14 @@ public class Board {
     private long[] historyKeys = new long[64];
     private int historySize;
 
+    NnueNetwork.State nnue;
+
+    public void setNnueNetwork(NnueNetwork network) {
+        if (network == null) nnue = null;
+        else if (nnue == null || nnue.network != network)
+            nnue = new NnueNetwork.State(network, this);
+    }
+
     private void pushHistory(int move, int capturedPieceCode, int oldCastling,
                              int oldEp, int oldHalfmove, long oldKey, long oldEpKey) {
         if (historySize == historyState.length) {
@@ -68,6 +76,8 @@ public class Board {
     }
 
     public void setFromFen(String fen) {
+        NnueNetwork network = nnue == null ? null : nnue.network;
+        nnue = null;
         for (int c = 0; c < 2; c++)
             for (int t = 0; t < 6; t++)
                 pieceBB[c][t] = 0L;
@@ -117,6 +127,7 @@ public class Board {
         epHashKey = enPassantHashKey();
         zobristKey = computeZobristFromScratch();
         recomputeEvaluationState();
+        setNnueNetwork(network);
     }
 
     private int typeFromChar(char c) {
@@ -211,6 +222,7 @@ public class Board {
     }
 
     private void updateEvaluationState(int color, int type, int square, int direction) {
+        if (nnue != null) nnue.change(color, type, square, direction);
         int sign = color == WHITE ? 1 : -1;
         incrementalMaterialScore += direction * sign * Evaluator.PIECE_VALUE[type];
         incrementalMgPstScore += direction * sign * Evaluator.pieceSquareMgValue(color, type, square);
@@ -220,6 +232,7 @@ public class Board {
     }
 
     private void updateMovedPieceEvaluation(int color, int type, int from, int to) {
+        if (nnue != null) nnue.move(color, type, from, to);
         int sign = color == WHITE ? 1 : -1;
         incrementalMgPstScore += sign * (Evaluator.pieceSquareMgValue(color, type, to)
                 - Evaluator.pieceSquareMgValue(color, type, from));
